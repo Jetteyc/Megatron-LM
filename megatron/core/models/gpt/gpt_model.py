@@ -1,13 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-"""GPT Model selector that chooses between GPTModelNormal and GPTModelModuleQueue.
-
-This module provides the `GPTModel` class which selects the appropriate
-implementation based on configuration:
-- If `post_process=True` AND `pipeline_parallel > 1` AND
-    `enable_module_queue=True`: use `GPTModelModuleQueue`
-- Otherwise: use `GPTModelNormal`
-"""
+"""GPT model selector for local split backends."""
 
 from typing import Literal, Optional
 
@@ -20,7 +13,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class GPTModel(GPTModelNormal):
-    """GPT Model class that dynamically selects between backends."""
+    """Select `GPTModelNormal` or `GPTModelModuleQueue` at construction time."""
 
     def __new__(
         cls,
@@ -46,7 +39,6 @@ class GPTModel(GPTModelNormal):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ):
-        """Create appropriate GPT model instance based on configuration."""
         if cls is not GPTModel:
             return super(GPTModel, cls).__new__(cls)
 
@@ -58,8 +50,7 @@ class GPTModel(GPTModelNormal):
             elif parallel_state.is_initialized():
                 pp_size = parallel_state.get_pipeline_model_parallel_world_size()
 
-            if pp_size > 1:
-                use_module_queue = True
+            use_module_queue = pp_size > 1
 
         backend_class = GPTModelModuleQueue if use_module_queue else GPTModelNormal
         return backend_class(
@@ -83,6 +74,3 @@ class GPTModel(GPTModelNormal):
             pg_collection=pg_collection,
             vp_stage=vp_stage,
         )
-
-
-__all__ = ['GPTModel', 'GPTModelNormal', 'GPTModelModuleQueue']

@@ -808,6 +808,16 @@ class TEGroupedMLP(MegatronModule):
             pg_collection=pg_collection,
         )
 
+        self.offload_expert_fc1 = (
+            self.config.fine_grained_activation_offloading
+            and "expert_fc1" in self.config.offload_modules
+        )
+
+        self.offload_moe_act = (
+            self.config.fine_grained_activation_offloading
+            and "moe_act" in self.config.offload_modules
+        )
+
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules

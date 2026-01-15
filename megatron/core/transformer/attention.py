@@ -34,6 +34,7 @@ from megatron.core.utils import (
     divide,
     get_pg_size,
     is_fa_min_version,
+    is_using_quantization_scales,
     is_te_min_version,
     nvtx_range_pop,
     nvtx_range_push,
@@ -469,7 +470,7 @@ class Attention(MegatronModule, ABC):
         rotary_cos: Tensor,
         rotary_sin: Tensor,
         rotary_interleaved: bool = False,
-    ) -> (Tensor, Tensor):
+    ) -> tuple[Tensor, Tensor]:
         """
         The flash decoding kernel will do the following in a single execution:
         1. Compute RoPE embedding with precomputed cos & sin tensors
@@ -716,8 +717,7 @@ class Attention(MegatronModule, ABC):
         # =====================
         # Query, Key, and Value
         # =====================
-        # Get the query, key and value tensors based on the type of attention -
-        # self or cross attn.
+        # Get the query, key and value tensors based on the type of attention.
         nvtx_range_push(suffix="qkv")
         split_qkv = (self.attention_type == "cross") or not all(
             [
@@ -727,25 +727,15 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params is None,
                 (
                     rotary_pos_emb is not None
-        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
-            qkv_output = self.get_query_key_value_tensors(
-                hidden_states,
-                key_value_states,
-                split_qkv=split_qkv,
-            )
-        if self.offload_qkv_linear:
-            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
-            qkv_output = off_interface.group_commit(
-                qkv_output, name="qkv_linear", forced_released_tensors=[]
-            )
+                    and rotary_pos_emb[0] is not None
+                    and rotary_pos_emb[1] is not None
+                ),
                 not self.config.flash_decode,
                 HAVE_FUSED_QKV_ROPE,
                 self.q_layernorm is None or isinstance(self.q_layernorm, IdentityOp),
                 self.k_layernorm is None or isinstance(self.k_layernorm, IdentityOp),
             ]
         )
-        # Check if fused_single_qkv_rope is requested but either unavailable or not
-        # supported for the current use case.
         if self.attention_type != "cross":
             assert not (
                 self.config.fused_single_qkv_rope and split_qkv
@@ -758,30 +748,26 @@ class Attention(MegatronModule, ABC):
                 split_qkv=split_qkv,
             )
         if self.offload_qkv_linear:
-            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
             qkv_output = off_interface.group_commit(
                 qkv_output, name="qkv_linear", forced_released_tensors=[]
             )
+
         attn_mask_type = self.attn_mask_type
         block_table = None
         if split_qkv:
             query, key, value = qkv_output
+            mixed_qkv, qkv_split_arg_list = None, None
         else:
             mixed_qkv, qkv_split_arg_list = qkv_output
         nvtx_range_pop(suffix="qkv")
 
-        # ===================================================
-        # Adjust key, value, and rotary_pos_emb for inference
-        # ===================================================
-
+        # Adjust key, value, and rotary_pos_emb for inference.
         in_decode_mode = (
             inference_context is not None
             and inference_context.is_decode_only()
             and not self.training
         )
 
-        # This branch only runs in the decode phase of flash decoding and returns after the linear
-        # projection. This conditional is not used in the prefill phase or non-flash-decoding cases.
         nvtx_range_push(suffix="adjust_key_value")
         if in_decode_mode and self.config.flash_decode:
             assert self.layer_number in inference_context.key_value_memory_dict
@@ -803,10 +789,8 @@ class Attention(MegatronModule, ABC):
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
             output, bias = self.linear_proj(context_layer)
+            nvtx_range_pop(suffix="adjust_key_value")
             return output, bias
-
-        if (
-            in_decode_mode
 
         if split_qkv:
             query, key, value, rotary_pos_emb, attn_mask_type, block_table = (
@@ -823,7 +807,7 @@ class Attention(MegatronModule, ABC):
                 )
             )
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
@@ -936,10 +920,16 @@ class Attention(MegatronModule, ABC):
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
-            if self.offload_core_attention and self.training:
-                core_attn_out = off_interface.group_commit(
-                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
-                )
+                # Clear the outputs for padding tokens when using quantization scales
+                # to avoid corrupting amax calculations
+                if is_using_quantization_scales(self.config):
+                    core_attn_out[inference_context.padding_slice] = 0.0
+
+        if self.offload_core_attention and self.training:
+            core_attn_out = off_interface.group_commit(
+                core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+            )
+
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
