@@ -22,6 +22,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -186,6 +189,21 @@ class Attention(MegatronModule, ABC):
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'
             and "core_attn" in self.config.recompute_modules
+        )
+
+        self.offload_qkv_linear = (
+            self.config.fine_grained_activation_offloading
+            and "qkv_linear" in self.config.offload_modules
+        )
+
+        self.offload_core_attention = (
+            self.config.fine_grained_activation_offloading
+            and "core_attn" in self.config.offload_modules
+        )
+
+        self.offload_attn_proj = (
+            self.config.fine_grained_activation_offloading
+            and "attn_proj" in self.config.offload_modules
         )
 
         # Output.
@@ -709,9 +727,17 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params is None,
                 (
                     rotary_pos_emb is not None
-                    and rotary_pos_emb[0] is not None
-                    and rotary_pos_emb[1] is not None
-                ),
+        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
+            qkv_output = self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                split_qkv=split_qkv,
+            )
+        if self.offload_qkv_linear:
+            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+            qkv_output = off_interface.group_commit(
+                qkv_output, name="qkv_linear", forced_released_tensors=[]
+            )
                 not self.config.flash_decode,
                 HAVE_FUSED_QKV_ROPE,
                 self.q_layernorm is None or isinstance(self.q_layernorm, IdentityOp),
@@ -725,9 +751,17 @@ class Attention(MegatronModule, ABC):
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
-        qkv_output = self.get_query_key_value_tensors(
-            hidden_states, key_value_states, split_qkv=split_qkv
-        )
+        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
+            qkv_output = self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                split_qkv=split_qkv,
+            )
+        if self.offload_qkv_linear:
+            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+            qkv_output = off_interface.group_commit(
+                qkv_output, name="qkv_linear", forced_released_tensors=[]
+            )
         attn_mask_type = self.attn_mask_type
         block_table = None
         if split_qkv:
@@ -773,11 +807,6 @@ class Attention(MegatronModule, ABC):
 
         if (
             in_decode_mode
-            and self.config.cuda_graph_impl == "local"
-            and self.config.cuda_graph_scope != "full_iteration"
-            and inference_context.is_static_batching()
-        ):
-            raise ValueError(f"CUDA graphs must use flash decode with static batching!")
 
         if split_qkv:
             query, key, value, rotary_pos_emb, attn_mask_type, block_table = (
@@ -875,15 +904,18 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                core_attn_out = self.core_attention(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    attn_mask_type=attn_mask_type,
-                    attention_bias=attention_bias,
-                    packed_seq_params=packed_seq_params,
-                )
+                with off_interface(
+                    self.offload_core_attention and self.training, query, "core_attn"
+                ) as query:
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        attn_mask_type=attn_mask_type,
+                        attention_bias=attention_bias,
+                        packed_seq_params=packed_seq_params,
+                    )
 
             else:
                 # Dynamic batching attention kernel.
@@ -904,6 +936,10 @@ class Attention(MegatronModule, ABC):
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
+            if self.offload_core_attention and self.training:
+                core_attn_out = off_interface.group_commit(
+                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+                )
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
@@ -917,7 +953,12 @@ class Attention(MegatronModule, ABC):
         # =================
 
         nvtx_range_push(suffix="linear_proj")
-        output, bias = self.linear_proj(core_attn_out)
+        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
+            output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            output = off_interface.group_commit(
+                output, name="attn_proj", forced_released_tensors=[core_attn_out]
+            )
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
