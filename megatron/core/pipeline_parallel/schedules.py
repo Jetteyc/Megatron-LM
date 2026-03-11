@@ -650,7 +650,7 @@ def forward_backward_no_pipelining(
             pg_collection=pg_collection,
         )
 
-    if not forward_only and config.fine_grained_activation_offloading:
+    if getattr(config, 'fine_grained_activation_offloading', False):
         off_interface.reset()
 
     if config.timers is not None:
@@ -1989,7 +1989,7 @@ def forward_backward_pipelining_with_interleaving(
             pg_collection=pg_collection,
         )
 
-    if not forward_only and config.fine_grained_activation_offloading:
+    if getattr(config, 'fine_grained_activation_offloading', False):
         off_interface.reset()
     # Restore config.grad_sync_func and config.param_sync_func.
     if forward_only:
@@ -2379,7 +2379,7 @@ def forward_backward_pipelining_without_interleaving(
             pg_collection=pg_collection,
         )
 
-    if not forward_only and config.fine_grained_activation_offloading:
+    if getattr(config, 'fine_grained_activation_offloading', False):
         off_interface.reset()
 
     if config.timers is not None:
