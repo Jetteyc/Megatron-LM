@@ -1,10 +1,15 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from functools import partial
+import os
 from typing import Callable, List, Optional, Union
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+from megatron.core.network_engine import get_global_network_engine
+from megatron.core.network_engine.enums import ParallelDomain
 
 try:
     from torch.distributed._tensor import DTensor, distribute_tensor
@@ -29,6 +34,20 @@ from ..utils import (
     get_pg_size,
     get_tensor_model_parallel_group_if_none,
 )
+
+
+def _ne_stream_ctx(domain, group):
+    """Get a ``torch.cuda.stream`` context for *domain* + *group* from NetworkEngine."""
+    if os.getenv("STAGGERED_1F1B", "0") != "1":
+        return nullcontext()
+    try:
+        ne = get_global_network_engine()
+        stream = ne.get_comm_stream_for_domain(domain=domain, group=group)
+        if stream is not None:
+            return torch.cuda.stream(stream)
+    except Exception:
+        pass
+    return nullcontext()
 
 
 def _get_main_grad_attr(param: torch.nn.Parameter):
@@ -119,7 +138,8 @@ def _allreduce_conditional_embedding_grads(
             # All-reduce the gradient on the first VPP rank.
             grads = [param_grad[0] for _, param_grad in grads_dict.items()]
             coalesced = _flatten_dense_tensors(grads)
-            torch.distributed.all_reduce(coalesced, group=pp_group)
+            with _ne_stream_ctx(ParallelDomain.PP, pp_group):
+                torch.distributed.all_reduce(coalesced, group=pp_group)
             for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
                 buf.copy_(synced)
 
@@ -247,7 +267,8 @@ def _allreduce_embedding_grad(
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
-        torch.distributed.all_reduce(grad, group=embd_group)
+        with _ne_stream_ctx(ParallelDomain.PP, embd_group):
+            torch.distributed.all_reduce(grad, group=embd_group)
         setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
@@ -365,7 +386,10 @@ def _allreduce_non_tensor_model_parallel_grads(
     ):
         if grads:
             coalesced = _flatten_dense_tensors(grads)
-            torch.distributed.all_reduce(coalesced, op=all_reduce_op, group=tp_group)
+            with _ne_stream_ctx(ParallelDomain.TP, tp_group):
+                torch.distributed.all_reduce(coalesced, group=tp_group)
+            if all_reduce_op == torch.distributed.ReduceOp.AVG:
+                coalesced /= tp_group.size()
             for param, buf, synced in zip(
                 params, grads, _unflatten_dense_tensors(coalesced, grads)
             ):
@@ -478,10 +502,12 @@ def finalize_model_grads(
         # to the other ranks in the pipeline parallel group.
         assert not isinstance(pp_group, list)
         last_rank = get_pp_last_rank(pp_group)
-        torch.distributed.broadcast(num_tokens, src=last_rank, group=pp_group)
+        with _ne_stream_ctx(ParallelDomain.PP, pp_group):
+            torch.distributed.broadcast(num_tokens, src=last_rank, group=pp_group)
 
         # all-reduce across DP ranks.
-        torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
+        with _ne_stream_ctx(ParallelDomain.DP, dp_cp_group):
+            torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
         for model_chunk in model:
             if num_tokens > 0:
                 scaling = 1.0 / num_tokens

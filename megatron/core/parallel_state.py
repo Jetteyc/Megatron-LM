@@ -13,7 +13,65 @@ import torch
 
 from .utils import GlobalMemoryBuffer, is_torch_min_version
 
+try:
+    from megatron.core.network_engine import get_global_network_engine
+    from megatron.core.network_engine.enums import ParallelDomain
+    from megatron.core.network_engine.backends import NvshmemBackend
+    from megatron.core.network_engine.topology import are_ranks_in_single_node as _are_ranks_in_single_node
+except Exception:
+    get_global_network_engine = None
+    ParallelDomain = None
+    NvshmemBackend = None
+    _are_ranks_in_single_node = None
+
+_NE_DOMAIN_DP = ParallelDomain.DP if ParallelDomain is not None else None
+_NE_DOMAIN_CP = ParallelDomain.CP if ParallelDomain is not None else None
+_NE_DOMAIN_TP = ParallelDomain.TP if ParallelDomain is not None else None
+_NE_DOMAIN_PP = ParallelDomain.PP if ParallelDomain is not None else None
+_NE_DOMAIN_EP = ParallelDomain.EP if ParallelDomain is not None else None
+
 logger = logging.getLogger(__name__)
+
+_NE_ROUTE_LOGGED = set()
+
+
+def _log_network_engine_route(domain, ranks: List[int]) -> None:
+    if os.getenv("STAGGERED_1F1B", "0") != "1":
+        return
+    if get_global_network_engine is None or ParallelDomain is None:
+        return
+    if domain is None:
+        return
+    if not ranks:
+        return
+    if len(ranks) <= 1:
+        # 单 rank 组不会发生实际跨 rank 通信，跳过路由解析日志，避免噪音。
+        return
+
+    key = (domain.value, tuple(int(r) for r in ranks))
+    if key in _NE_ROUTE_LOGGED:
+        return
+    _NE_ROUTE_LOGGED.add(key)
+
+    try:
+        intranode = _are_ranks_in_single_node(ranks) if _are_ranks_in_single_node is not None else False
+        backend, traffic = get_global_network_engine().resolve(
+            domain,
+            intranode=intranode,
+        )
+
+        backend_name = backend.name
+
+        logger.info(
+            "[NetworkEngine][ParallelState] domain=%s via_network_engine=True scope=%s backend=%s traffic=%s ranks=%s",
+            domain.value,
+            "intranode" if intranode else "internode",
+            backend_name,
+            traffic.value,
+            list(ranks),
+        )
+    except Exception:
+        pass
 
 try:
     import einops
@@ -898,12 +956,14 @@ def initialize_model_parallel(
             _DATA_PARALLEL_GROUP = group
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
             _DATA_PARALLEL_GLOBAL_RANKS = ranks
+            _log_network_engine_route(_NE_DOMAIN_DP, ranks)
 
     # Build the context-parallel groups.
     global _CONTEXT_PARALLEL_GROUP
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
     for ranks in decoder_rank_generator.get_ranks('cp'):
+        ranks = sorted(ranks)
         group = create_group(
             ranks,
             timeout=timeout,
@@ -913,6 +973,7 @@ def initialize_model_parallel(
         if rank in ranks:
             _CONTEXT_PARALLEL_GROUP = group
             _CONTEXT_PARALLEL_GLOBAL_RANKS = ranks
+            _log_network_engine_route(_NE_DOMAIN_CP, ranks)
         if hierarchical_context_parallel_sizes:
             assert np.prod(hierarchical_context_parallel_sizes) == context_parallel_size
             global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
@@ -959,6 +1020,7 @@ def initialize_model_parallel(
         if rank in ranks:
             _TENSOR_MODEL_PARALLEL_GROUP = group
             _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = ranks
+            _log_network_engine_route(_NE_DOMAIN_TP, ranks)
 
     # Build the pipeline model-parallel groups and embedding groups
     # (first and last rank in each pipeline model-parallel group).
@@ -1053,6 +1115,7 @@ def initialize_model_parallel(
             else:
                 _PIPELINE_MODEL_PARALLEL_GROUP = [_PIPELINE_MODEL_PARALLEL_GROUP, group]
                 _PIPELINE_GLOBAL_RANKS = [_PIPELINE_GLOBAL_RANKS, ranks]
+            _log_network_engine_route(_NE_DOMAIN_PP, ranks)
 
         embedding_ranks = get_embedding_ranks(ranks)
         group = create_group(
@@ -1127,6 +1190,7 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _EXPERT_MODEL_PARALLEL_GROUP = group
+            _log_network_engine_route(_NE_DOMAIN_EP, ranks)
 
     # Build the expert tensor parallel group
     global _EXPERT_TENSOR_PARALLEL_GROUP

@@ -283,9 +283,10 @@ class TransformerLayerNode(ScheduleNode):
         """Computes the weight gradients for the transformer layer node."""
         if not self.delay_wgrad_compute:
             return
-        with torch.cuda.nvtx.range(f"{self.name} wgrad"):
-            for module in self.bwd_dw_callables:
-                module.backward_dw()
+        with torch.cuda.stream(self.stream):
+            with torch.cuda.nvtx.range(f"{self.name} wgrad"):
+                for module in self.bwd_dw_callables:
+                    module.backward_dw()
         self.bwd_dw_callables = None
 
     def _release_state(self):

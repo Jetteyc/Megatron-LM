@@ -3,8 +3,10 @@
 import dataclasses
 import inspect
 import io
+import logging
 import os
 import pickle
+import sys
 import warnings
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -53,6 +55,15 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
+
+try:
+    from megatron.core.network_engine import get_global_network_engine
+    from megatron.core.network_engine.scheduler import get_comm_stream_for_domain
+    from megatron.core.network_engine.enums import ParallelDomain
+except Exception:
+    get_global_network_engine = None
+    get_comm_stream_for_domain = None
+    ParallelDomain = None
 
 try:
     import transformer_engine as te
@@ -915,7 +926,39 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 "1.0.0"
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
             if getattr(TEDotProductAttention, "cp_stream") is None:
-                TEDotProductAttention.cp_stream = torch.cuda.Stream()
+                if os.getenv("STAGGERED_1F1B", "0") == "1":
+                    cp_stream = None
+                    fallback_reason = None
+                    if get_comm_stream_for_domain is not None and ParallelDomain is not None:
+                        try:
+                            cp_stream = get_comm_stream_for_domain(
+                                domain=ParallelDomain.CP,
+                                group=pg_collection.cp,
+                                intranode=None,
+                            )
+                        except Exception as exc:
+                            cp_stream = None
+                            fallback_reason = f"exception={type(exc).__name__}: {exc}"
+                    else:
+                        fallback_reason = "network_engine import unavailable"
+
+                    if cp_stream is None:
+                        if fallback_reason is None:
+                            fallback_reason = "network_engine returned no stream"
+                        msg = (
+                            "[NetworkEngine][Fallback] TEDotProductAttention.cp_stream "
+                            "failed to get network_engine CP stream; "
+                            f"reason={fallback_reason}"
+                        )
+                        logging.getLogger(__name__).warning(msg)
+                        print(msg, file=sys.stderr)
+                        raise RuntimeError(
+                            "TEDotProductAttention requires network_engine CP stream "
+                            "(strict stream ownership mode)"
+                        )
+                else:
+                    cp_stream = torch.cuda.Stream()
+                TEDotProductAttention.cp_stream = cp_stream
             extra_kwargs["cp_group"] = pg_collection.cp
             extra_kwargs["cp_global_ranks"] = torch.distributed.get_process_group_ranks(
                 pg_collection.cp

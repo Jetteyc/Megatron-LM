@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
+import os
 from functools import partial
 from typing import Callable, Iterator, List, Optional, Union
 
@@ -27,6 +28,10 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+
+# Sentinel for staggered schedule: backward grad is deferred (not yet available).
+# Distinct from None which means "last stage, loss backward needed".
+_DEFERRED_GRAD = object()
 
 from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
@@ -1246,7 +1251,11 @@ def forward_backward_pipelining_with_interleaving(
                 output_tensor_grads[model_chunk_id].append(None)
         input_tensor = input_tensors[model_chunk_id].pop(0)
         output_tensor = output_tensors[model_chunk_id].pop(0)
-        output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
+
+        if len(output_tensor_grads[model_chunk_id]) == 0:
+            output_tensor_grad = _DEFERRED_GRAD
+        else:
+            output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
 
         return input_tensor, output_tensor, output_tensor_grad
 
@@ -1542,6 +1551,13 @@ def forward_backward_pipelining_with_interleaving(
 
     # Run 1F1B in steady state.
     nvtx_range_push(suffix="steady")
+    if config.overlap_moe_expert_parallel_comm and not forward_only:
+        from megatron.core.models.common.model_chunk_schedule_plan import (
+            StaggeredTransformerModelChunkSchedulePlan,
+        )
+        StaggeredTransformerModelChunkSchedulePlan._deferred_grad_getter = (
+            lambda mc_id: output_tensor_grads[mc_id].pop(0)
+        )
     for k in range(num_microbatches_remaining):
         # Forward pass.
         forward_k = k + num_warmup_microbatches
@@ -1651,7 +1667,7 @@ def forward_backward_pipelining_with_interleaving(
                             recv_next_wait_handle.wait()
 
             # Async backward send / receive
-            def pp_post_backward(input_tensor_grad, vp_stage=None):
+            def pp_post_backward_baseline(input_tensor_grad, vp_stage=None):
                 nonlocal send_prev_wait_handle
                 nonlocal bwd_wait_handles
                 nonlocal recv_next_wait_handles
@@ -1693,6 +1709,61 @@ def forward_backward_pipelining_with_interleaving(
                     )
                     bwd_recv_buffer[(backward_k + 1) % bwd_recv_buffer_size] = None
                 return input_tensor_grad
+
+            # NOTE: _captured_bk default arg captures backward_k by VALUE so that
+            # when this closure is stored in _pending_bwd_state and called one
+            # iteration later by run_first_layer_part1, it still uses the correct
+            # backward iteration index (not the next iteration's).
+            def pp_post_backward_staggered(input_tensor_grad, vp_stage=None, _captured_bk=backward_k):
+                nonlocal send_prev_wait_handle
+                nonlocal bwd_wait_handles
+                nonlocal recv_next_wait_handles
+                bk = _captured_bk
+                if vp_stage is None:
+                    vp_stage = get_model_chunk_id(bk, forward=False)
+                # First virtual stage no activation gradient tensor to send.
+                if _is_vp_first_stage(vp_stage=vp_stage) and is_pp_first_stage(pp_group):
+                    input_tensor_grad = None
+
+                recv_next, next_backward_model_chunk_id = recv_tensor_from_previous_stage(
+                    bk, forward=False
+                )
+
+                (bwd_recv_buffer[bk % bwd_recv_buffer_size], bwd_wait_handles) = (
+                    p2p_communicator.send_backward_recv_backward(
+                        input_tensor_grad,
+                        recv_next=recv_next,
+                        tensor_shape=tensor_shape,
+                        overlap_p2p_comm=True,
+                    )
+                )
+                if send_prev_wait_handle is not None:
+                    send_prev_wait_handle.wait()
+                if bwd_wait_handles is not None:
+                    send_prev_wait_handle = (
+                        bwd_wait_handles.pop("send_prev")
+                        if "send_prev" in bwd_wait_handles
+                        else None
+                    )
+                    if "recv_next" in bwd_wait_handles:
+                        recv_next_wait_handles.append(bwd_wait_handles.pop("recv_next"))
+
+                # Put input_tensor and output_tensor_grad in data structures in the
+                # right location.
+
+                if recv_next:
+                    output_tensor_grads[next_backward_model_chunk_id].append(
+                        bwd_recv_buffer[bk % bwd_recv_buffer_size]
+                    )
+                    bwd_recv_buffer[(bk + 1) % bwd_recv_buffer_size] = None
+                return input_tensor_grad
+
+            use_staggered_post_backward = os.getenv("STAGGERED_1F1B", "0") == "1"
+            pp_post_backward = (
+                pp_post_backward_staggered
+                if use_staggered_post_backward
+                else pp_post_backward_baseline
+            )
 
             output_tensor, input_tensor_grad = forward_backward_helper_wrapper(
                 f_virtual_microbatch_id=forward_k,
@@ -1756,6 +1827,16 @@ def forward_backward_pipelining_with_interleaving(
                 output_tensor_grads[next_backward_model_chunk_id].append(output_tensor_grad)
 
     deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+
+    # Flush the final deferred backward before entering cooldown.
+    if config.overlap_moe_expert_parallel_comm and not forward_only and num_microbatches_remaining > 0:
+        from megatron.core.models.common.model_chunk_schedule_plan import (
+            StaggeredTransformerModelChunkSchedulePlan,
+        )
+
+        if StaggeredTransformerModelChunkSchedulePlan._pending_bwd_state is not None:
+            StaggeredTransformerModelChunkSchedulePlan.flush_pending_backward()
+
     nvtx_range_pop(suffix="steady")
 
     # Run cooldown backward passes (flush out pipeline) for the last model chunk.

@@ -706,9 +706,21 @@ class GPTModelNormal(LanguageModule):
             TransformerModelChunkSchedulePlan: The model chunk schedule plan.
         """
 
-        from ..common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
+        import os
 
-        return TransformerModelChunkSchedulePlan(
+        from ..common.model_chunk_schedule_plan import (
+            StaggeredTransformerModelChunkSchedulePlan,
+            TransformerModelChunkSchedulePlan,
+        )
+
+        use_staggered_plan = os.getenv("STAGGERED_1F1B", "0") == "1"
+        schedule_plan_cls = (
+            StaggeredTransformerModelChunkSchedulePlan
+            if use_staggered_plan
+            else TransformerModelChunkSchedulePlan
+        )
+
+        return schedule_plan_cls(
             self,
             input_ids,
             position_ids,

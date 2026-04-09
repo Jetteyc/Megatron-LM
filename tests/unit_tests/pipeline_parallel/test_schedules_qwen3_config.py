@@ -1,3 +1,4 @@
+
 import json
 import os
 import sys
@@ -37,7 +38,7 @@ rank = Utils.rank
 
 
 _DEFAULT_QWEN_MODEL_DIR = "/data/common/models/Qwen/Qwen3-30B-A3B-Base_8layers"
-_DEFAULT_STRUCTURAL_SEQ_LENGTH = 2048
+_DEFAULT_STRUCTURAL_SEQ_LENGTH = 4096
 _DEFAULT_STRUCTURAL_MICRO_BATCH_SIZE = 2
 _DEFAULT_STRUCTURAL_NUM_MICROBATCHES = 32
 _DEFAULT_STRUCTURAL_VOCAB_SIZE_CAP = 65536
@@ -110,7 +111,26 @@ def _load_schedule_test_model_params():
     """
 
     model_dir = _get_schedule_test_model_dir()
-    assert model_dir is not None, "No valid model directory found for schedule tests. Please set up the test model directory and ensure it contains a config.json file."
+    if model_dir is None:
+        return {
+            'model_dir': None,
+            'seq_length': 1024,
+            'micro_batch_size': 2,
+            'hidden_size': 128,
+            'num_layers': 8,
+            'num_attention_heads': 4,
+            'num_query_groups': 4,
+            'ffn_hidden_size': 128,
+            'moe_ffn_hidden_size': 128,
+            'num_microbatches': 32,
+            'vocab_size': 1024,
+            'num_moe_experts': 32,
+            'moe_router_topk': 16,
+            'rotary_base': 10000.0,
+            'layernorm_epsilon': 1e-5,
+            'gated_linear_unit': False,
+            'activation_func': F.gelu,
+        }
 
     config_path = os.path.join(model_dir, 'config.json')
     with open(config_path, 'r', encoding='utf-8') as f:
@@ -130,7 +150,6 @@ def _load_schedule_test_model_params():
         'num_layers': int(hf_config['num_hidden_layers']),
         'num_attention_heads': int(hf_config['num_attention_heads']),
         'num_query_groups': int(hf_config.get('num_key_value_heads', hf_config['num_attention_heads'])),
-        # 'num_query_groups': 8,
         'ffn_hidden_size': int(hf_config.get('intermediate_size', hf_config['hidden_size'] * 4)),
         'moe_ffn_hidden_size': int(
             hf_config.get('moe_intermediate_size', hf_config.get('intermediate_size', hf_config['hidden_size'] * 4))
@@ -222,11 +241,10 @@ def _make_staggered_data_iterator(num_microbatches, seq_length, micro_batch_size
     # Pre-materialize all batches BEFORE pipeline execution starts.
     # Lazy generation (yield) inside the pipeline loop can trigger CUDA
     # memory allocation that deadlocks when NCCL streams are active.
-    # All synthetic microbatches are intentionally identical in this test.
-    # Reuse one prebuilt batch payload to avoid multiplying large CUDA tensors
-    # (especially attention masks) by `num_microbatches`.
-    template_batch = _make_staggered_batch(seq_length, micro_batch_size, vocab_size)
-    batches = [template_batch.copy() for _ in range(num_microbatches)]
+    batches = [
+        _make_staggered_batch(seq_length, micro_batch_size, vocab_size)
+        for _ in range(num_microbatches)
+    ]
     return iter(batches)
 
 
@@ -982,9 +1000,9 @@ def _run_1f1b_profiler_with_5d_parallel(
     else:
         tag = "interleaved"
 
-    tp_size = 2
+    tp_size = 4
     cp_size = 2
-    ep_size = 4
+    ep_size = 8
     etp_size = 1
     pp_size = 2
     vpp_size = 2

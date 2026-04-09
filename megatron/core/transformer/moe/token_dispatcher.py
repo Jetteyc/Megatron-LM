@@ -1,6 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
+from contextlib import contextmanager
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -11,6 +13,14 @@ from megatron.core.config import is_experimental_enabled
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
+from megatron.core.network_engine.topology import (
+    are_ranks_in_single_node,
+    get_group_global_ranks,
+    get_local_world_size,
+    is_group_intranode,
+)
+from megatron.core.network_engine import get_global_network_engine
+from megatron.core.network_engine.enums import ParallelDomain
 from megatron.core.tensor_parallel import (
     all_to_all,
     gather_from_sequence_parallel_region,
@@ -19,6 +29,7 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.moe.fused_a2a import (
     fused_combine,
     fused_dispatch,
+    get_buffer,
     set_deepep_num_sms,
 )
 from megatron.core.transformer.moe.moe_utils import (
@@ -32,6 +43,32 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+_DEEPEP_RUNTIME_OVERRIDE_LOGGED = False
+_DEEPEP_FORCE_SYNC = os.getenv("DEEPEP_FORCE_SYNC", "0") == "1"
+_DEEPEP_SYNC_CHECKPOINT = os.getenv("DEEPEP_SYNC_CHECKPOINT", "0") == "1"
+
+
+def _use_network_engine_for_baseline() -> bool:
+    return os.getenv("STAGGERED_1F1B", "0") == "1"
+
+
+def _moe_comm_nvtx_enabled() -> bool:
+    return os.getenv("NE_NVTX_DISABLE", "0") != "1"
+
+
+def _moe_comm_record_function_enabled() -> bool:
+    return os.getenv("NE_RECORD_FUNCTION_DISABLE", "0") != "1"
+
+
+@contextmanager
+def _moe_comm_nvtx(name: str):
+    if _moe_comm_record_function_enabled():
+        with torch.profiler.record_function(name):
+            yield
+    else:
+        yield
 
 """ We use the following notation throughout this file:
      H: hidden size
@@ -70,6 +107,7 @@ class MoETokenDispatcher:
         self.tp_size = utils.get_pg_size(self.tp_group)
         self.tp_rank = utils.get_pg_rank(self.tp_group)
         self.ep_size = utils.get_pg_size(self.ep_group)
+
 
     @abstractmethod
     def dispatch_preprocess(
@@ -247,18 +285,21 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             with torch.no_grad():
                 # [num_local_tokens, num_experts] -> [num_global_tokens, num_experts], where:
                 #     num_local_tokens=(S/TP)*B, num_global_tokens=S*B*EP
-                self.routing_map = gather_from_sequence_parallel_region(
-                    self.routing_map, group=self.tp_ep_group
-                )
+                with _moe_comm_nvtx("moe.allgather.tp_ep.routing_map"):
+                    self.routing_map = gather_from_sequence_parallel_region(
+                        self.routing_map, group=self.tp_ep_group
+                    )
 
             ## local_probs calculation
             # max_prob: [S/TP*B, num_experts] -> global_probs: [S*B*EP, num_experts]
-            probs = gather_from_sequence_parallel_region(probs, group=self.tp_ep_group)
+            with _moe_comm_nvtx("moe.allgather.tp_ep.probs"):
+                probs = gather_from_sequence_parallel_region(probs, group=self.tp_ep_group)
             # Note that this allgather spans the communication domain of TP*EP.
             #  [(S/TP)*B, H] -> [((S/TP)*B)*(TP*EP), H] = [S*B*EP, H]
-            hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, group=self.tp_ep_group, use_global_buffer=True
-            )
+            with _moe_comm_nvtx("moe.allgather.tp_ep.hidden_states"):
+                hidden_states = gather_from_sequence_parallel_region(
+                    hidden_states, group=self.tp_ep_group, use_global_buffer=True
+                )
 
         return hidden_states, probs
 
@@ -320,9 +361,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         """
         # Unpermute the tokens across ranks.
         if self.tp_size > 1 or self.ep_size > 1:
-            hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states.to(self.local_probs.dtype), group=self.tp_ep_group
-            ).to(hidden_states.dtype)
+            with _moe_comm_nvtx("moe.reduce_scatter.tp_ep.hidden_states"):
+                hidden_states = reduce_scatter_to_sequence_parallel_region(
+                    hidden_states.to(self.local_probs.dtype), group=self.tp_ep_group
+                ).to(hidden_states.dtype)
         return hidden_states
 
     def combine_postprocess(self, hidden_states):
@@ -495,13 +537,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # num_global_tokens_per_expert represents the number of tokens sent to each
             # expert by all ranks.
             # [tp_size, ep_size, num_experts]
-            num_global_tokens_per_expert = (
-                gather_from_sequence_parallel_region(
-                    num_local_tokens_per_expert, group=self.tp_ep_group
+            with _moe_comm_nvtx("moe.allgather.tp_ep.preprocess.num_tokens_per_expert"):
+                num_global_tokens_per_expert = (
+                    gather_from_sequence_parallel_region(
+                        num_local_tokens_per_expert, group=self.tp_ep_group
+                    )
+                    .reshape(self.ep_size, self.tp_size, self.num_experts)
+                    .transpose(0, 1)
                 )
-                .reshape(self.ep_size, self.tp_size, self.num_experts)
-                .transpose(0, 1)
-            )
             # [tp_size, ep_size, num_experts] -> [tp_size, ep_size, num_local_experts]
             num_global_tokens_per_local_expert = num_global_tokens_per_expert[
                 :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
@@ -623,12 +666,22 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
         )
-        global_input_tokens = all_to_all(
-            self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
-        )
-        global_probs = all_to_all(
-            self.ep_group, permuted_probs, self.output_splits, self.input_splits
-        )
+        with _moe_comm_nvtx("moe.all_to_all.ep.dispatch.tokens"):
+            global_input_tokens = all_to_all(
+                self.ep_group,
+                permutated_local_input_tokens,
+                self.output_splits,
+                self.input_splits,
+                domain=ParallelDomain.EP,
+            )
+        with _moe_comm_nvtx("moe.all_to_all.ep.dispatch.probs"):
+            global_probs = all_to_all(
+                self.ep_group,
+                permuted_probs,
+                self.output_splits,
+                self.input_splits,
+                domain=ParallelDomain.EP,
+            )
 
         return global_input_tokens, global_probs
 
@@ -653,12 +706,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 output_split_sizes = None
             else:
                 output_split_sizes = self.output_splits_tp.tolist()
-            global_input_tokens = gather_from_sequence_parallel_region(
-                global_input_tokens, group=self.tp_group, output_split_sizes=output_split_sizes
-            )
-            global_probs = gather_from_sequence_parallel_region(
-                global_probs, group=self.tp_group, output_split_sizes=output_split_sizes
-            )
+            with _moe_comm_nvtx("moe.allgather.tp.dispatch_postprocess.tokens"):
+                global_input_tokens = gather_from_sequence_parallel_region(
+                    global_input_tokens, group=self.tp_group, output_split_sizes=output_split_sizes
+                )
+            with _moe_comm_nvtx("moe.allgather.tp.dispatch_postprocess.probs"):
+                global_probs = gather_from_sequence_parallel_region(
+                    global_probs, group=self.tp_group, output_split_sizes=output_split_sizes
+                )
 
         # Permutation 2: Sort tokens by local expert.
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -736,11 +791,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 input_split_sizes = None
             else:
                 input_split_sizes = self.output_splits_tp.tolist()
-            hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states.to(self.probs.dtype),
-                group=self.tp_group,
-                input_split_sizes=input_split_sizes,
-            ).to(hidden_states.dtype)
+            with _moe_comm_nvtx("moe.reduce_scatter.tp.combine_preprocess.hidden_states"):
+                hidden_states = reduce_scatter_to_sequence_parallel_region(
+                    hidden_states.to(self.probs.dtype),
+                    group=self.tp_group,
+                    input_split_sizes=input_split_sizes,
+                ).to(hidden_states.dtype)
 
         return hidden_states
 
@@ -767,9 +823,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
-        permutated_local_input_tokens = all_to_all(
-            self.ep_group, hidden_states, self.input_splits, self.output_splits
-        )
+        with _moe_comm_nvtx("moe.all_to_all.ep.combine.hidden_states"):
+            permutated_local_input_tokens = all_to_all(
+                self.ep_group,
+                hidden_states,
+                self.input_splits,
+                self.output_splits,
+                domain=ParallelDomain.EP,
+            )
         return permutated_local_input_tokens
 
     def combine_postprocess(self, permutated_local_input_tokens):
@@ -955,6 +1016,28 @@ class _DeepepManager(_DispatchManager):
         self.capacity_factor = config.moe_expert_capacity_factor
         self.permute_fusion = config.moe_permute_fusion
 
+        try:
+            world_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+            local_rank = world_rank % max(get_local_world_size(), 1)
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            lws = get_local_world_size()
+            group_ranks = get_group_global_ranks(group)
+            node_ids = [int(r) // lws for r in group_ranks]
+            logging.getLogger(__name__).warning(
+                "[DeepEP][manager-init] world_rank=%s local_rank=%s world_size=%s local_world_size=%s "
+                "tp_ep_group_size=%s tp_ep_group_ranks=%s node_ids=%s group_intranode=%s",
+                world_rank,
+                local_rank,
+                world_size,
+                lws,
+                group.size(),
+                group_ranks,
+                node_ids,
+                are_ranks_in_single_node(group_ranks, lws),
+            )
+        except Exception as exc:
+            logging.getLogger(__name__).warning("[DeepEP][manager-init] topology debug failed: %s", exc)
+
         # Metadata
         self.token_indices: Optional[torch.Tensor] = None
         self.token_probs: Optional[torch.Tensor] = None
@@ -979,6 +1062,46 @@ class _DeepepManager(_DispatchManager):
         if self.capacity_factor is not None:
             mask = self.token_probs == 0
             self.token_indices = self.token_indices.masked_fill(mask, -1)
+        try:
+            logger = logging.getLogger(__name__)
+            logger.info(
+                "[DeepEP] setup_metadata: num_tokens=%s, num_experts=%s, router_topk=%s, "
+                "router_dtype=%s, probs.dtype=%s, token_probs.dtype=%s, token_indices.dtype=%s",
+                num_tokens,
+                self.num_experts,
+                self.router_topk,
+                self.router_dtype,
+                probs.dtype,
+                self.token_probs.dtype,
+                self.token_indices.dtype,
+            )
+            with torch.no_grad():
+                probs_min = probs.min().item()
+                probs_max = probs.max().item()
+                topk_min = self.token_probs.min().item()
+                topk_max = self.token_probs.max().item()
+                idx_min = self.token_indices.min().item()
+                idx_max = self.token_indices.max().item()
+                invalid_low = (self.token_indices < -1).any().item()
+                invalid_high = (self.token_indices >= self.num_experts).any().item()
+                nan_probs = torch.isnan(probs).any().item()
+                inf_probs = torch.isinf(probs).any().item()
+                logger.info(
+                    "[DeepEP] setup_metadata stats: probs[min=%s,max=%s,nan=%s,inf=%s], "
+                    "topk[min=%s,max=%s], idx[min=%s,max=%s,invalid_low=%s,invalid_high=%s]",
+                    probs_min,
+                    probs_max,
+                    nan_probs,
+                    inf_probs,
+                    topk_min,
+                    topk_max,
+                    idx_min,
+                    idx_max,
+                    invalid_low,
+                    invalid_high,
+                )
+        except Exception as exc:
+            logging.getLogger(__name__).warning("[DeepEP] setup_metadata debug failed: %s", exc)
 
     def dispatch(
         self,
@@ -986,6 +1109,20 @@ class _DeepepManager(_DispatchManager):
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
     ) -> torch.Tensor:
+        try:
+            logging.getLogger(__name__).info(
+                "[DeepEP] dispatch enter: hidden_states.shape=%s dtype=%s device=%s contig=%s "
+                "async_finish=%s allocate_on_comm_stream=%s group.size()=%s",
+                tuple(hidden_states.shape),
+                hidden_states.dtype,
+                hidden_states.device,
+                hidden_states.is_contiguous(),
+                async_finish,
+                allocate_on_comm_stream,
+                self.group.size(),
+            )
+        except Exception as exc:
+            logging.getLogger(__name__).warning("[DeepEP] dispatch debug failed: %s", exc)
         # DeepEP only supports float32 probs
         if self.token_probs.dtype != torch.float32:
             if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
@@ -1168,18 +1305,160 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         assert (
             self.config.moe_pad_expert_input_to_capacity is False
         ), "Flex token dispatcher does not support --moe-pad-expert-input-to-capacity"
-        self._comm_manager = _DeepepManager(
-            group=self.tp_ep_group,
-            num_local_experts=self.num_local_experts,
-            router_topk=self.tp_size * self.config.moe_router_topk,
-            num_experts=self.tp_size * self.config.num_moe_experts,
-            config=self.config,
+        self._fallback_dispatcher: Optional[MoETokenDispatcher] = None
+        self._use_deepep = True
+
+        group_ranks = []
+        group_intranode = False
+        try:
+            group_ranks = get_group_global_ranks(self.tp_ep_group)
+            group_intranode = is_group_intranode(self.tp_ep_group)
+            lws = get_local_world_size()
+            node_ids = [int(r) // lws for r in group_ranks]
+            logging.getLogger(__name__).warning(
+                "[DeepEP][flex-init] world_rank=%s local_rank=%s tp_size=%s ep_size=%s "
+                "tp_ep_group_size=%s tp_ep_group_ranks=%s node_ids=%s group_intranode=%s",
+                torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                (torch.distributed.get_rank() if torch.distributed.is_initialized() else -1) % max(get_local_world_size(), 1),
+                self.tp_size,
+                self.ep_size,
+                self.tp_ep_group.size(),
+                group_ranks,
+                node_ids,
+                group_intranode,
+            )
+        except Exception as exc:
+            logging.getLogger(__name__).warning("[DeepEP][flex-init] topology debug failed: %s", exc)
+
+        # Hybrid policy:
+        # - intranode TPxEP group: use DeepEP (NVSHMEM intranode)
+        # - internode TPxEP group: fallback to torch alltoall dispatcher
+        use_deepep = group_intranode
+        if _use_network_engine_for_baseline():
+            try:
+                backend, _ = get_global_network_engine().resolve(
+                    ParallelDomain.EP,
+                    intranode=group_intranode,
+                )
+                use_deepep = backend.name == "deepep"
+            except Exception:
+                pass
+
+        if use_deepep:
+            self._comm_manager = _DeepepManager(
+                group=self.tp_ep_group,
+                num_local_experts=self.num_local_experts,
+                router_topk=self.tp_size * self.config.moe_router_topk,
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                config=self.config,
+            )
+            logging.getLogger(__name__).warning(
+                "[DeepEP][flex-init] dispatcher=deepep tp_ep_group_ranks=%s", group_ranks
+            )
+
+            # Preflight: DeepEP-Universal may still fail in multinode runtime even for
+            # intranode EP groups (e.g., deep_ep.cpp:510). Probe once and fall back
+            # consistently on the whole EP group if any rank fails.
+            if not self._deepep_preflight_ok():
+                logging.getLogger(__name__).warning(
+                    "[DeepEP][flex-init] preflight failed, fallback to torch alltoall dispatcher"
+                )
+                self._switch_to_torch_fallback(
+                    num_local_experts=num_local_experts,
+                    local_expert_indices=local_expert_indices,
+                    config=config,
+                    pg_collection=pg_collection,
+                )
+        else:
+            self._switch_to_torch_fallback(
+                num_local_experts=num_local_experts,
+                local_expert_indices=local_expert_indices,
+                config=config,
+                pg_collection=pg_collection,
+            )
+            logging.getLogger(__name__).warning(
+                "[DeepEP][flex-init] dispatcher=torch_alltoall tp_ep_group_ranks=%s",
+                group_ranks,
+            )
+
+    def _switch_to_torch_fallback(
+        self,
+        *,
+        num_local_experts: int,
+        local_expert_indices: List[int],
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection],
+    ) -> None:
+        self._use_deepep = False
+        self._fallback_dispatcher = MoEAlltoAllTokenDispatcher(
+            num_local_experts=num_local_experts,
+            local_expert_indices=local_expert_indices,
+            config=config,
+            pg_collection=pg_collection,
         )
 
-    def set_shared_experts(self, shared_experts):
-        raise NotImplementedError(
-            "Shared expert overlap is not supported in Flex Token Dispatcher."
+    def _deepep_preflight_ok(self) -> bool:
+        """Probe DeepEP buffer init once and synchronize decision in current EP group."""
+        ok = 1
+        try:
+            # BF16 hidden bytes hint; only used for buffer sizing probe.
+            hidden_bytes = int(self.config.hidden_size) * 2
+            _ = get_buffer(self.tp_ep_group, hidden_bytes)
+            logging.getLogger(__name__).warning(
+                "[DeepEP][preflight] local_success rank=%s group_size=%s",
+                torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                self.tp_ep_group.size(),
+            )
+        except Exception as exc:
+            ok = 0
+            logging.getLogger(__name__).warning(
+                "[DeepEP][preflight] local_failure rank=%s err=%s",
+                torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                exc,
+            )
+
+        # Ensure the whole EP group takes the same dispatcher branch.
+        if torch.distributed.is_initialized() and self.tp_ep_group is not None:
+            flag = torch.tensor([ok], dtype=torch.int32, device=torch.cuda.current_device())
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN, group=self.tp_ep_group)
+            ok = int(flag.item())
+
+        logging.getLogger(__name__).warning(
+            "[DeepEP][preflight] group_result ok=%s rank=%s",
+            bool(ok),
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
         )
+        return bool(ok)
+
+    def _maybe_override_runtime_flags(
+        self,
+        *,
+        async_finish: bool,
+        allocate_on_comm_stream: bool,
+        op_name: str,
+    ) -> tuple[bool, bool, bool]:
+        """Apply optional runtime debug overrides for DeepEP dispatch/combine."""
+        global _DEEPEP_RUNTIME_OVERRIDE_LOGGED
+        force_sync = _DEEPEP_FORCE_SYNC
+        enable_sync_checkpoint = _DEEPEP_SYNC_CHECKPOINT
+
+        if force_sync:
+            async_finish = False
+            allocate_on_comm_stream = False
+            if not _DEEPEP_RUNTIME_OVERRIDE_LOGGED:
+                logging.getLogger(__name__).warning(
+                    f"[DeepEP] DEEPEP_FORCE_SYNC=1: overriding {op_name} to "
+                    "async_finish=False, allocate_on_comm_stream=False"
+                )
+                _DEEPEP_RUNTIME_OVERRIDE_LOGGED = True
+
+        return async_finish, allocate_on_comm_stream, enable_sync_checkpoint
+
+    def set_shared_experts(self, shared_experts):
+        if self._fallback_dispatcher is not None:
+            self._fallback_dispatcher.set_shared_experts(shared_experts)
+            return
+        raise NotImplementedError("Shared expert overlap is not supported in Flex Token Dispatcher.")
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
@@ -1211,6 +1490,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
+        if self._fallback_dispatcher is not None:
+            return self._fallback_dispatcher.dispatch_preprocess(hidden_states, routing_map, probs)
+
         """Initializes routing metadata and prepares tensors for fused dispatch.
 
         This method reshapes input tensors and processes routing information into a
@@ -1241,6 +1523,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ):
+        if self._fallback_dispatcher is not None:
+            return self._fallback_dispatcher.token_dispatch(hidden_states, probs)
+
         """
         Execute fused permutation and AlltoAll communication.
 
@@ -1258,12 +1543,26 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of dispatched tokens and probabilities.
         """
+        async_finish, allocate_on_comm_stream, enable_sync_checkpoint = (
+            self._maybe_override_runtime_flags(
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+                op_name="token_dispatch",
+            )
+        )
+
+        if enable_sync_checkpoint:
+            torch.cuda.synchronize()
+
         return (
             self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream),
             self._comm_manager.dispatched_probs,
         )
 
     def dispatch_postprocess(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+        if self._fallback_dispatcher is not None:
+            return self._fallback_dispatcher.dispatch_postprocess(hidden_states, probs)
+
         """Converts dispatched tokens to a per-expert format for expert processing.
 
         This method transforms the output of the fused dispatch into the tensor
@@ -1283,6 +1582,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         return global_input_tokens, tokens_per_expert, permuted_probs
 
     def combine_preprocess(self, hidden_states: torch.Tensor):
+        if self._fallback_dispatcher is not None:
+            return self._fallback_dispatcher.combine_preprocess(hidden_states)
+
         """Pre-processes hidden states before combining them after expert processing.
 
         This method restores the hidden states to their original ordering before expert processing
@@ -1297,6 +1599,13 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ):
+        if self._fallback_dispatcher is not None:
+            return self._fallback_dispatcher.token_combine(
+                hidden_states,
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
+
         """Executes fused un-permutation and communication using DeepEP kernels.
 
         This is the inverse of the `token_dispatch` operation.
@@ -1309,9 +1618,28 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             Combined tokens after fused un-permutation and communication.
         """
-        return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
+        async_finish, allocate_on_comm_stream, enable_sync_checkpoint = (
+            self._maybe_override_runtime_flags(
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+                op_name="token_combine",
+            )
+        )
+
+        if enable_sync_checkpoint:
+            torch.cuda.synchronize()
+
+        combined = self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
+
+        if enable_sync_checkpoint:
+            torch.cuda.synchronize()
+
+        return combined
 
     def combine_postprocess(self, hidden_states: torch.Tensor):
+        if self._fallback_dispatcher is not None:
+            return self._fallback_dispatcher.combine_postprocess(hidden_states)
+
         """
         Restores the original tensor shape and finalizes the MoE layer output.
 

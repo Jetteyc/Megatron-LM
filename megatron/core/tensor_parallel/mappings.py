@@ -1,69 +1,98 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
+import os
+
 import torch
 
-from megatron.core.parallel_state import get_global_memory_buffer
-from megatron.core.utils import get_tensor_model_parallel_group_if_none, is_torch_min_version
+from megatron.core.network_engine import get_global_network_engine
+from megatron.core.parallel_state import (
+    get_context_parallel_group,
+    get_global_memory_buffer,
+    get_tensor_model_parallel_group,
+)
+from megatron.core.utils import get_tensor_model_parallel_group_if_none
+
+try:
+    from megatron.core.network_engine.enums import ParallelDomain
+except Exception:
+    ParallelDomain = None
 
 from .utils import split_tensor_along_last_dim
 
-try:
-    if is_torch_min_version("1.13.0"):
-        dist_all_gather_func = torch.distributed.all_gather_into_tensor
-        dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
-    else:
-        dist_all_gather_func = torch.distributed._all_gather_base
-        dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
-except:
-    dist_all_gather_func = torch.distributed._all_gather_base
-    dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
+
+def _ne_stream_ctx(domain, group):
+    """Get a ``torch.cuda.stream`` context manager for *domain* + *group*.
+
+    Returns ``nullcontext()`` when the NetworkEngine is unavailable or
+    stream resolution fails, so the caller always falls back to the
+    default stream.
+    """
+    if os.getenv("STAGGERED_1F1B", "0") != "1":
+        return nullcontext()
+    try:
+        ne = get_global_network_engine()
+        stream = ne.get_comm_stream_for_domain(domain=domain, group=group)
+        if stream is not None:
+            return torch.cuda.stream(stream)
+    except Exception:
+        pass
+    return nullcontext()
+
+
+def _infer_domain_for_group(group, default=ParallelDomain.TP):
+    if ParallelDomain is None:
+        return default
+    try:
+        tp_group = get_tensor_model_parallel_group(check_initialized=False)
+        if group is tp_group:
+            return ParallelDomain.TP
+    except Exception:
+        pass
+    try:
+        cp_group = get_context_parallel_group(check_initialized=False)
+        if group is cp_group:
+            return ParallelDomain.CP
+    except Exception:
+        pass
+    return default
 
 
 def _reduce(input_, group):
     """All-reduce the input tensor across model parallel group."""
     assert group is not None, "group should not be None"
 
-    # Bypass the function if we are using only 1 GPU.
     if group.size() == 1:
         return input_
 
-    # All-reduce.
-    torch.distributed.all_reduce(input_.contiguous(), group=group)
-
+    domain = ParallelDomain.TP if ParallelDomain is not None else None
+    with _ne_stream_ctx(domain, group):
+        torch.distributed.all_reduce(input_.contiguous(), group=group)
     return input_
 
 
 def _split_along_last_dim(input_, group):
-    """Split the tensor along its last dimension and keep the
-    corresponding slice."""
+    """Split the tensor along its last dimension and keep the corresponding slice."""
     assert group is not None, "group should not be None"
 
     world_size = group.size()
-    # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
 
-    # Split along last dimension.
     input_list = split_tensor_along_last_dim(input_, world_size)
-
-    # Note: torch.split does not create contiguous tensors by default.
     rank = group.rank()
     output = input_list[rank].contiguous()
-
     return output
 
 
 def _split_along_first_dim(input_, group):
-    """Split the tensor along its first dimension and keep the
-    corresponding slice."""
+    """Split the tensor along its first dimension and keep the corresponding slice."""
     assert group is not None, "group should not be None"
 
     world_size = group.size()
-    # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
 
-    # Split along first dimension.
     dim_size = input_.size()[0]
     assert (
         dim_size % world_size == 0
@@ -73,15 +102,12 @@ def _split_along_first_dim(input_, group):
     dim_offset = rank * local_dim_size
 
     output = input_[dim_offset : dim_offset + local_dim_size].contiguous()
-
     return output
 
 
 def _gather_along_last_dim(input_, group):
     """Gather tensors and concatinate along the last dimension."""
-
     world_size = group.size()
-    # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
 
@@ -89,16 +115,18 @@ def _gather_along_last_dim(input_, group):
     dim_size[0] = dim_size[0] * world_size
 
     output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
-    dist_all_gather_func(output, input_.contiguous(), group=group)
+    input_contiguous = input_.contiguous()
+    output_tensor_list = list(torch.split(output, input_contiguous.shape[0], dim=0))
+    domain = ParallelDomain.TP if ParallelDomain is not None else None
+    with _ne_stream_ctx(domain, group):
+        torch.distributed.all_gather(output_tensor_list, input_contiguous, group=group)
     tensor_list = output.chunk(world_size, dim=0)
     output = torch.cat(tensor_list, dim=-1).contiguous()
-
     return output
 
 
 def _reduce_scatter_along_last_dim(input_, group):
     """Reduce-scatter tensors on the last dimension."""
-
     world_size = group.size()
     target_shape = list(input_.size())
     target_shape[-1] = target_shape[-1] // world_size
@@ -112,22 +140,9 @@ def _reduce_scatter_along_last_dim(input_, group):
 
 
 def _gather_along_first_dim(input_, group, output_split_sizes=None, use_global_buffer=False):
-    """Gather tensors and concatenate along the first dimension.
-
-    Args:
-        input_tensor (torch.Tensor):
-            A tensor to be gathered.
-        output_split_sizes (List[int], optional):
-            A list specifying the sizes of the output splits along the first dimension.
-            If None, equal splitting is assumed. Default: None.
-
-    Returns:
-        torch.Tensor: Gathered tensor.
-    """
-
+    """Gather tensors and concatenate along the first dimension."""
     assert group is not None, "group should not be None"
     world_size = group.size()
-    # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
 
@@ -139,7 +154,11 @@ def _gather_along_first_dim(input_, group, output_split_sizes=None, use_global_b
             output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
-        dist_all_gather_func(output, input_.contiguous(), group=group)
+        input_contiguous = input_.contiguous()
+        output_tensor_list = list(torch.split(output, input_contiguous.shape[0], dim=0))
+        domain = _infer_domain_for_group(group, default=ParallelDomain.CP)
+        with _ne_stream_ctx(domain, group):
+            torch.distributed.all_gather(output_tensor_list, input_contiguous, group=group)
     else:
         dim_size[0] = sum(output_split_sizes)
         if use_global_buffer:
@@ -147,23 +166,17 @@ def _gather_along_first_dim(input_, group, output_split_sizes=None, use_global_b
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
         output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
-        torch.distributed.all_gather(output_tensor_list, input_, group=group)
+        domain = _infer_domain_for_group(group, default=ParallelDomain.CP)
+        with _ne_stream_ctx(domain, group):
+            torch.distributed.all_gather(output_tensor_list, input_, group=group)
 
     return output
 
 
 def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_global_buffer=False):
-    """Reduce-scatter the input tensor across model parallel group.
-
-    Args:
-        input_ (torch.Tensor): The input tensor to be reduce-scattered.
-        input_split_sizes (List[int], optional): A list specifying the sizes of
-            the input splits along the first dimension for each rank. If None,
-            equal splitting is assumed. Default: None.
-    """
+    """Reduce-scatter the input tensor across model parallel group."""
     assert group is not None, "group should not be None"
     world_size = group.size()
-    # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
 
@@ -179,7 +192,12 @@ def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_g
             output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
-        dist_reduce_scatter_func(output, input_.contiguous(), group=group)
+        input_contiguous = input_.contiguous()
+        chunk_size = input_contiguous.shape[0] // world_size
+        input_tensor_list = list(torch.split(input_contiguous, chunk_size, dim=0))
+        domain = _infer_domain_for_group(group, default=ParallelDomain.CP)
+        with _ne_stream_ctx(domain, group):
+            torch.distributed.reduce_scatter(output, input_tensor_list, group=group)
     else:
         rank = group.rank()
         input_tensor_list = list(torch.split(input_, input_split_sizes, dim=0))
@@ -190,7 +208,9 @@ def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_g
             )
         else:
             output = torch.empty_like(input_tensor_list[rank])
-        torch.distributed.reduce_scatter(output, input_tensor_list, group=group)
+        domain = _infer_domain_for_group(group, default=ParallelDomain.CP)
+        with _ne_stream_ctx(domain, group):
+            torch.distributed.reduce_scatter(output, input_tensor_list, group=group)
     return output
 
 
@@ -419,35 +439,40 @@ class _ReduceScatterToTensorParallelRegion(torch.autograd.Function):
 
 class _AllToAll(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, group, input, output_split_sizes, input_split_sizes):
+    def forward(ctx, group, input, output_split_sizes, input_split_sizes, domain):
         """Forward function."""
+        if output_split_sizes is not None:
+            output_split_sizes = tuple(int(x) for x in output_split_sizes)
+        if input_split_sizes is not None:
+            input_split_sizes = tuple(int(x) for x in input_split_sizes)
+
         ctx.group = group
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
+        ctx.domain = domain
 
         world_size = group.size()
-        # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input
 
         input = input.contiguous()
         if output_split_sizes is None:
-            # Equal split (all2all)
             output = torch.empty_like(input)
+            output_chunks = list(output.chunk(world_size, dim=0))
+            input_chunks = list(input.chunk(world_size, dim=0))
         else:
-            # Unequal split (all2all-v)
             output = input.new_empty(
                 size=[sum(output_split_sizes)] + list(input.size()[1:]),
                 dtype=input.dtype,
                 device=torch.cuda.current_device(),
             )
-        torch.distributed.all_to_all_single(
-            output,
-            input,
-            output_split_sizes=output_split_sizes,
-            input_split_sizes=input_split_sizes,
-            group=group,
-        )
+            output_chunks = list(torch.split(output, output_split_sizes, dim=0))
+            input_chunks = list(torch.split(input, input_split_sizes, dim=0))
+
+        ne = get_global_network_engine()
+        ne_domain = domain if domain is not None else ParallelDomain.TP
+        with _ne_stream_ctx(ne_domain, group):
+            torch.distributed.all_to_all(output_chunks, input_chunks, group=group)
         return output
 
     @staticmethod
@@ -455,7 +480,14 @@ class _AllToAll(torch.autograd.Function):
         """Backward function."""
         return (
             None,
-            _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes),
+            _AllToAll.apply(
+                ctx.group,
+                *grad_output,
+                ctx.input_split_sizes,
+                ctx.output_split_sizes,
+                ctx.domain,
+            ),
+            None,
             None,
             None,
         )
@@ -532,10 +564,16 @@ def reduce_scatter_last_dim_to_tensor_parallel_region(input_, group=None):
     return _ReduceScatterToTensorParallelRegion.apply(input_, group)
 
 
-def all_to_all(group, input_, output_split_sizes_=None, input_split_sizes=None):
+def all_to_all(
+    group,
+    input_,
+    output_split_sizes_=None,
+    input_split_sizes=None,
+    domain=None,
+):
     """Wrapper for autograd function"""
     assert group is not None, "group should not be None"
-    return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes)
+    return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes, domain)
 
 
 def all_to_all_sp2hp(input_, group=None):
