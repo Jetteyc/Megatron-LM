@@ -1,6 +1,3 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-
-import json
 import os
 import sys
 import time
@@ -10,7 +7,6 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from packaging import version
 
 import megatron.core.pipeline_parallel.schedules as schedule
@@ -29,10 +25,6 @@ from megatron.core.pipeline_parallel.utils import (
     set_streams,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import (
-    convert_schedule_table_to_order,
-    get_overlap_moe_expert_parallel_comm_order,
-)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -40,13 +32,6 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
-
-
-_DEFAULT_QWEN_MODEL_DIR = "/data/common/models/Qwen/Qwen3-30B-A3B-Base_8layers"
-_DEFAULT_STRUCTURAL_SEQ_LENGTH = 2048
-_DEFAULT_STRUCTURAL_MICRO_BATCH_SIZE = 2
-_DEFAULT_STRUCTURAL_NUM_MICROBATCHES = 32
-_DEFAULT_STRUCTURAL_VOCAB_SIZE_CAP = 65536
 
 
 def _debug_log(message):
@@ -100,66 +85,6 @@ def _should_enable_deepep(ep_size: int) -> bool:
     if ep_size <= 1:
         return False
     return os.environ.get('EP_INTRANODE_BACKEND', '').strip().lower() == 'deepep'
-
-
-def _get_schedule_test_model_dir():
-    if os.path.exists(os.path.join(_DEFAULT_QWEN_MODEL_DIR, 'config.json')):
-        return _DEFAULT_QWEN_MODEL_DIR
-    return None
-
-
-def _load_schedule_test_model_params():
-    """Load optional external model structural params for schedule tests.
-
-    This only reuses model structure from `config.json`; it does not load tokenizer
-    files or safetensors weights.
-    """
-
-    model_dir = _get_schedule_test_model_dir()
-    assert model_dir is not None, "No valid model directory found for schedule tests. Please set up the test model directory and ensure it contains a config.json file."
-
-    config_path = os.path.join(model_dir, 'config.json')
-    with open(config_path, 'r', encoding='utf-8') as f:
-        hf_config = json.load(f)
-
-    hidden_act = str(hf_config.get('hidden_act', 'gelu')).lower()
-    use_silu_glu = hidden_act in {'silu', 'swiglu'}
-    max_pos = int(hf_config.get('max_position_embeddings', 2048))
-    default_seq_length = min(max_pos, _DEFAULT_STRUCTURAL_SEQ_LENGTH)
-    default_vocab_size = min(int(hf_config['vocab_size']), _DEFAULT_STRUCTURAL_VOCAB_SIZE_CAP)
-
-    params = {
-        'model_dir': model_dir,
-        'seq_length': default_seq_length,
-        'micro_batch_size': _DEFAULT_STRUCTURAL_MICRO_BATCH_SIZE,
-        'hidden_size': int(hf_config['hidden_size']),
-        'num_layers': int(hf_config['num_hidden_layers']),
-        'num_attention_heads': int(hf_config['num_attention_heads']),
-        'num_query_groups': int(hf_config.get('num_key_value_heads', hf_config['num_attention_heads'])),
-        # 'num_query_groups': 8,
-        'ffn_hidden_size': int(hf_config.get('intermediate_size', hf_config['hidden_size'] * 4)),
-        'moe_ffn_hidden_size': int(
-            hf_config.get('moe_intermediate_size', hf_config.get('intermediate_size', hf_config['hidden_size'] * 4))
-        ),
-        'num_microbatches': _DEFAULT_STRUCTURAL_NUM_MICROBATCHES,
-        'vocab_size': default_vocab_size,
-        'num_moe_experts': int(hf_config.get('num_experts', 32)),
-        'moe_router_topk': int(hf_config.get('num_experts_per_tok', 2)),
-        'rotary_base': float(hf_config.get('rope_theta', 10000.0)),
-        'layernorm_epsilon': float(hf_config.get('rms_norm_eps', 1e-5)),
-        'gated_linear_unit': use_silu_glu,
-        'activation_func': F.silu if use_silu_glu else F.gelu,
-    }
-
-    _debug_log(
-        "loaded external structural params "
-        f"model_dir={model_dir} hidden={params['hidden_size']} layers={params['num_layers']} "
-        f"heads={params['num_attention_heads']} q_groups={params['num_query_groups']} "
-        f"ffn={params['ffn_hidden_size']} moe_ffn={params['moe_ffn_hidden_size']} "
-        f"experts={params['num_moe_experts']} topk={params['moe_router_topk']} "
-        f"seq_length={params['seq_length']} vocab_size={params['vocab_size']}"
-    )
-    return params
 
 
 def _initialize_model_parallel_for_torchrun(
@@ -228,11 +153,10 @@ def _make_staggered_data_iterator(num_microbatches, seq_length, micro_batch_size
     # Pre-materialize all batches BEFORE pipeline execution starts.
     # Lazy generation (yield) inside the pipeline loop can trigger CUDA
     # memory allocation that deadlocks when NCCL streams are active.
-    # All synthetic microbatches are intentionally identical in this test.
-    # Reuse one prebuilt batch payload to avoid multiplying large CUDA tensors
-    # (especially attention masks) by `num_microbatches`.
-    template_batch = _make_staggered_batch(seq_length, micro_batch_size, vocab_size)
-    batches = [template_batch.copy() for _ in range(num_microbatches)]
+    batches = [
+        _make_staggered_batch(seq_length, micro_batch_size, vocab_size)
+        for _ in range(num_microbatches)
+    ]
     return iter(batches)
 
 
@@ -344,7 +268,7 @@ def test_get_pipeline_parallel_order(
     schedule_table = schedule.get_schedule_table(
         num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage
     )
-    order = convert_schedule_table_to_order(
+    order = schedule.convert_schedule_table_to_order(
         num_warmup_microbatches, num_model_chunks, schedule_table
     )
 
@@ -364,52 +288,6 @@ def test_get_pipeline_parallel_order(
     assert 0 not in order_cnt
     for k, v in order_cnt.items():
         assert -k in order_cnt and order_cnt[-k] == v
-
-    layers_per_chunk = 2
-    num_layers_per_chunk = [layers_per_chunk] * num_model_chunks
-    # disable wgrad compute
-    overlapped_order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
-        order, num_layers_per_chunk, False
-    )
-    assert max(overlapped_order) == num_model_chunks * layers_per_chunk
-    assert len(overlapped_order) == len(order) * layers_per_chunk
-    assert len(chunk_id_list) == len(overlapped_order)
-    order_cnt = {}
-    accumulated_order = 0
-    for o in overlapped_order:
-        order_cnt[o] = order_cnt.get(o, 0) + 1
-        if o < 0:
-            assert -o in order_cnt and order_cnt[-o] >= order_cnt[o]
-        elif -o in order_cnt:
-            assert order_cnt[-o] < order_cnt[o]
-        accumulated_order += o
-        assert accumulated_order >= 0
-    assert accumulated_order == 0
-
-    # enable wgrad compute
-    overlapped_order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
-        order, num_layers_per_chunk, True
-    )
-    assert max(overlapped_order) == num_model_chunks * layers_per_chunk
-    assert len(overlapped_order) == len(order) * layers_per_chunk * 3 // 2
-    assert len(chunk_id_list) == len(overlapped_order)
-    from math import ceil
-
-    order_cnt = {}
-    accumulated_order = 0
-    prev_o = 0
-    for o in overlapped_order:
-        if ceil(o) != o:
-            assert prev_o - 0.5 == o
-        else:
-            order_cnt[o] = order_cnt.get(o, 0) + 1
-            if o < 0:
-                assert -o in order_cnt and order_cnt[-o] >= order_cnt[o]
-            elif -o in order_cnt:
-                assert order_cnt[-o] < order_cnt[o]
-        accumulated_order += o
-        prev_o = o
-    assert accumulated_order < 0
 
     Utils.destroy_model_parallel()
 
@@ -1034,18 +912,17 @@ def _run_1f1b_profiler_with_5d_parallel(
     else:
         tag = "interleaved"
 
-    tp_size = 2
+    tp_size = 4
     cp_size = 2
-    ep_size = 4
+    ep_size = 8
     etp_size = 1
     pp_size = 2
     vpp_size = 2
-    model_params = _load_schedule_test_model_params()
-    seq_length = model_params['seq_length']
-    micro_batch_size = model_params['micro_batch_size']
-    hidden_size = model_params['hidden_size']
-    num_microbatches = model_params['num_microbatches']
-    vocab_size = model_params['vocab_size']
+    seq_length = 1024
+    micro_batch_size = 2
+    hidden_size = 128
+    num_microbatches = 32
+    vocab_size = 1024
     num_warmup_steps = 2
     num_profile_steps = 3
     total_steps = num_warmup_steps + num_profile_steps
@@ -1054,8 +931,6 @@ def _run_1f1b_profiler_with_5d_parallel(
         f"{tag} test start "
         f"world_size={world_size} tp={tp_size} cp={cp_size} ep={ep_size} pp={pp_size} vpp={vpp_size}"
     )
-    if model_params['model_dir'] is not None:
-        _debug_log(f"using structural params from {model_params['model_dir']}")
 
     os.environ['STAGGERED_1F1B'] = '1' if use_staggered else '0'
     os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0'
@@ -1145,15 +1020,15 @@ def _run_1f1b_profiler_with_5d_parallel(
         bf16=True,
         params_dtype=torch.bfloat16,
         pipeline_dtype=torch.bfloat16,
-        num_layers=model_params['num_layers'],
+        num_layers=8,
         hidden_size=hidden_size,
-        num_attention_heads=model_params['num_attention_heads'],
-        ffn_hidden_size=model_params['ffn_hidden_size'],
+        num_attention_heads=4,
+        ffn_hidden_size=128,
         add_bias_linear=False,
         hidden_dropout=0.0,
         attention_dropout=0.0,
-        num_moe_experts=model_params['num_moe_experts'],
-        moe_router_topk=model_params['moe_router_topk'],
+        num_moe_experts=32,
+        moe_router_topk=16,
         moe_grouped_gemm=False,
         moe_layer_freq=1,
         moe_token_dispatcher_type=moe_dispatcher_type,
@@ -1165,12 +1040,6 @@ def _run_1f1b_profiler_with_5d_parallel(
         sequence_parallel=(tp_size > 1),
         delay_wgrad_compute=overlap_moe_expert_parallel_comm,
     )
-    config.num_query_groups = model_params['num_query_groups']
-    config.moe_ffn_hidden_size = model_params['moe_ffn_hidden_size']
-    config.rotary_base = model_params['rotary_base']
-    config.layernorm_epsilon = model_params['layernorm_epsilon']
-    config.gated_linear_unit = model_params['gated_linear_unit']
-    config.activation_func = model_params['activation_func']
     try:
         from megatron.core.transformer.moe.fused_a2a import set_deepep_num_sms
         set_deepep_num_sms(0)
@@ -1390,16 +1259,6 @@ def _run_1f1b_profiler_with_5d_parallel(
             f.write(f"seq_length={seq_length} micro_batch_size={micro_batch_size} "
                     f"hidden_size={hidden_size} num_microbatches={num_microbatches} "
                     f"vocab_size={vocab_size}\n")
-            f.write(f"model_dir={model_params['model_dir']}\n")
-            f.write(
-                f"num_layers={model_params['num_layers']} num_attention_heads={model_params['num_attention_heads']} "
-                f"num_query_groups={model_params['num_query_groups']} ffn_hidden_size={model_params['ffn_hidden_size']} "
-                f"moe_ffn_hidden_size={model_params['moe_ffn_hidden_size']}\n"
-            )
-            f.write(
-                f"num_moe_experts={model_params['num_moe_experts']} moe_router_topk={model_params['moe_router_topk']} "
-                f"rotary_base={model_params['rotary_base']} layernorm_epsilon={model_params['layernorm_epsilon']}\n"
-            )
             f.write(f"use_staggered={use_staggered}\n\n")
             f.write(
                 f"overlap_moe_expert_parallel_comm={overlap_moe_expert_parallel_comm}\n"

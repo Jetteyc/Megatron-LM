@@ -42,8 +42,15 @@ def pytest_sessionfinish(session, exitstatus):
 def cleanup():
     yield
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-        torch.distributed.destroy_process_group()
+        try:
+            if torch.cuda.is_available():
+                torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+            else:
+                torch.distributed.barrier()
+        except Exception as exc:
+            print(f"[unit_tests.cleanup] barrier skipped due to: {exc}", file=sys.stderr)
+        finally:
+            torch.distributed.destroy_process_group()
 
 
 @pytest.fixture(scope="function", autouse=True)

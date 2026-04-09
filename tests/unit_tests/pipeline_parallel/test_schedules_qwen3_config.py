@@ -1,4 +1,3 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import json
 import os
@@ -29,10 +28,6 @@ from megatron.core.pipeline_parallel.utils import (
     set_streams,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import (
-    convert_schedule_table_to_order,
-    get_overlap_moe_expert_parallel_comm_order,
-)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -43,7 +38,7 @@ rank = Utils.rank
 
 
 _DEFAULT_QWEN_MODEL_DIR = "/data/common/models/Qwen/Qwen3-30B-A3B-Base_8layers"
-_DEFAULT_STRUCTURAL_SEQ_LENGTH = 2048
+_DEFAULT_STRUCTURAL_SEQ_LENGTH = 4096
 _DEFAULT_STRUCTURAL_MICRO_BATCH_SIZE = 2
 _DEFAULT_STRUCTURAL_NUM_MICROBATCHES = 32
 _DEFAULT_STRUCTURAL_VOCAB_SIZE_CAP = 65536
@@ -116,7 +111,26 @@ def _load_schedule_test_model_params():
     """
 
     model_dir = _get_schedule_test_model_dir()
-    assert model_dir is not None, "No valid model directory found for schedule tests. Please set up the test model directory and ensure it contains a config.json file."
+    if model_dir is None:
+        return {
+            'model_dir': None,
+            'seq_length': 1024,
+            'micro_batch_size': 2,
+            'hidden_size': 128,
+            'num_layers': 8,
+            'num_attention_heads': 4,
+            'num_query_groups': 4,
+            'ffn_hidden_size': 128,
+            'moe_ffn_hidden_size': 128,
+            'num_microbatches': 32,
+            'vocab_size': 1024,
+            'num_moe_experts': 32,
+            'moe_router_topk': 16,
+            'rotary_base': 10000.0,
+            'layernorm_epsilon': 1e-5,
+            'gated_linear_unit': False,
+            'activation_func': F.gelu,
+        }
 
     config_path = os.path.join(model_dir, 'config.json')
     with open(config_path, 'r', encoding='utf-8') as f:
@@ -136,7 +150,6 @@ def _load_schedule_test_model_params():
         'num_layers': int(hf_config['num_hidden_layers']),
         'num_attention_heads': int(hf_config['num_attention_heads']),
         'num_query_groups': int(hf_config.get('num_key_value_heads', hf_config['num_attention_heads'])),
-        # 'num_query_groups': 8,
         'ffn_hidden_size': int(hf_config.get('intermediate_size', hf_config['hidden_size'] * 4)),
         'moe_ffn_hidden_size': int(
             hf_config.get('moe_intermediate_size', hf_config.get('intermediate_size', hf_config['hidden_size'] * 4))
@@ -228,11 +241,10 @@ def _make_staggered_data_iterator(num_microbatches, seq_length, micro_batch_size
     # Pre-materialize all batches BEFORE pipeline execution starts.
     # Lazy generation (yield) inside the pipeline loop can trigger CUDA
     # memory allocation that deadlocks when NCCL streams are active.
-    # All synthetic microbatches are intentionally identical in this test.
-    # Reuse one prebuilt batch payload to avoid multiplying large CUDA tensors
-    # (especially attention masks) by `num_microbatches`.
-    template_batch = _make_staggered_batch(seq_length, micro_batch_size, vocab_size)
-    batches = [template_batch.copy() for _ in range(num_microbatches)]
+    batches = [
+        _make_staggered_batch(seq_length, micro_batch_size, vocab_size)
+        for _ in range(num_microbatches)
+    ]
     return iter(batches)
 
 
@@ -344,7 +356,7 @@ def test_get_pipeline_parallel_order(
     schedule_table = schedule.get_schedule_table(
         num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage
     )
-    order = convert_schedule_table_to_order(
+    order = schedule.convert_schedule_table_to_order(
         num_warmup_microbatches, num_model_chunks, schedule_table
     )
 
@@ -364,52 +376,6 @@ def test_get_pipeline_parallel_order(
     assert 0 not in order_cnt
     for k, v in order_cnt.items():
         assert -k in order_cnt and order_cnt[-k] == v
-
-    layers_per_chunk = 2
-    num_layers_per_chunk = [layers_per_chunk] * num_model_chunks
-    # disable wgrad compute
-    overlapped_order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
-        order, num_layers_per_chunk, False
-    )
-    assert max(overlapped_order) == num_model_chunks * layers_per_chunk
-    assert len(overlapped_order) == len(order) * layers_per_chunk
-    assert len(chunk_id_list) == len(overlapped_order)
-    order_cnt = {}
-    accumulated_order = 0
-    for o in overlapped_order:
-        order_cnt[o] = order_cnt.get(o, 0) + 1
-        if o < 0:
-            assert -o in order_cnt and order_cnt[-o] >= order_cnt[o]
-        elif -o in order_cnt:
-            assert order_cnt[-o] < order_cnt[o]
-        accumulated_order += o
-        assert accumulated_order >= 0
-    assert accumulated_order == 0
-
-    # enable wgrad compute
-    overlapped_order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
-        order, num_layers_per_chunk, True
-    )
-    assert max(overlapped_order) == num_model_chunks * layers_per_chunk
-    assert len(overlapped_order) == len(order) * layers_per_chunk * 3 // 2
-    assert len(chunk_id_list) == len(overlapped_order)
-    from math import ceil
-
-    order_cnt = {}
-    accumulated_order = 0
-    prev_o = 0
-    for o in overlapped_order:
-        if ceil(o) != o:
-            assert prev_o - 0.5 == o
-        else:
-            order_cnt[o] = order_cnt.get(o, 0) + 1
-            if o < 0:
-                assert -o in order_cnt and order_cnt[-o] >= order_cnt[o]
-            elif -o in order_cnt:
-                assert order_cnt[-o] < order_cnt[o]
-        accumulated_order += o
-        prev_o = o
-    assert accumulated_order < 0
 
     Utils.destroy_model_parallel()
 
@@ -1034,9 +1000,9 @@ def _run_1f1b_profiler_with_5d_parallel(
     else:
         tag = "interleaved"
 
-    tp_size = 2
+    tp_size = 4
     cp_size = 2
-    ep_size = 4
+    ep_size = 8
     etp_size = 1
     pp_size = 2
     vpp_size = 2

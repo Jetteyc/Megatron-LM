@@ -1,6 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -161,6 +161,26 @@ class P2PCommunicator:
             if config.virtual_pipeline_model_parallel_size is not None
             else None
         )
+
+        # Get PP communication stream from NetworkEngine (if available).
+        # Keep baseline behavior aligned with upstream Megatron: baseline
+        # launches P2P on the caller's current stream, while staggered uses
+        # a dedicated PP stream to support its deferred-backward design.
+        self._pp_stream = None
+        use_dedicated_pp_stream = os.getenv("STAGGERED_1F1B", "0") == "1"
+        if use_dedicated_pp_stream:
+            try:
+                from megatron.core.network_engine import get_global_network_engine
+                from megatron.core.network_engine.enums import ParallelDomain
+
+                ne = get_global_network_engine()
+                if ne is not None:
+                    self._pp_stream = ne.get_comm_stream_for_domain(
+                        domain=ParallelDomain.PP,
+                        group=pp_group,
+                    )
+            except Exception:
+                pass
 
     def _communicate_shapes(self, tensor_send_next, tensor_send_prev, recv_prev, recv_next):
         """Communicate tensor shapes between stages. Used to communicate
@@ -365,32 +385,43 @@ class P2PCommunicator:
         else:
             reqs = {}
 
-        tensor_recv_prev = None
-        tensor_recv_next = None
-        if tensor_recv_prev_func is not None:
-            tensor_recv_prev = tensor_recv_prev_func()
+        # --- Run P2P on dedicated NE stream if available ---
+        from contextlib import nullcontext
+        _pp_stream = self._pp_stream
+        _stream_ctx = torch.cuda.stream(_pp_stream) if _pp_stream is not None else nullcontext()
 
-        if tensor_recv_next_func is not None:
-            tensor_recv_next = tensor_recv_next_func()
+        with _stream_ctx:
+            tensor_recv_prev = None
+            tensor_recv_next = None
+            if tensor_recv_prev_func is not None:
+                tensor_recv_prev = tensor_recv_prev_func()
 
-        p2p_reqs = p2p_func(
-            tensor_send_prev=tensor_send_prev,
-            tensor_recv_prev=tensor_recv_prev,
-            tensor_send_next=tensor_send_next,
-            tensor_recv_next=tensor_recv_next,
-            group=pp_group,
-            prev_pipeline_rank=prev_rank,
-            next_pipeline_rank=next_rank,
-        )
-        if isinstance(p2p_reqs, list):
-            reqs.extend(p2p_reqs)
-        else:
-            reqs.update(p2p_reqs)
+            if tensor_recv_next_func is not None:
+                tensor_recv_next = tensor_recv_next_func()
 
-        if wait_on_reqs and len(reqs) > 0:
-            for req in reqs if isinstance(reqs, list) else reqs.values():
-                req.wait()
-            reqs = None
+            p2p_reqs = p2p_func(
+                tensor_send_prev=tensor_send_prev,
+                tensor_recv_prev=tensor_recv_prev,
+                tensor_send_next=tensor_send_next,
+                tensor_recv_next=tensor_recv_next,
+                group=pp_group,
+                prev_pipeline_rank=prev_rank,
+                next_pipeline_rank=next_rank,
+            )
+            if isinstance(p2p_reqs, list):
+                reqs.extend(p2p_reqs)
+            else:
+                reqs.update(p2p_reqs)
+
+            if wait_on_reqs and len(reqs) > 0:
+                for req in reqs if isinstance(reqs, list) else reqs.values():
+                    req.wait()
+                reqs = None
+
+        # Sync PP stream back to default stream so recv buffers are visible
+        if _pp_stream is not None and wait_on_reqs:
+            _ev = _pp_stream.record_event()
+            torch.cuda.current_stream().wait_event(_ev)
 
         if config.batch_p2p_comm and config.batch_p2p_sync:
             # To protect against race condition when using batch_isend_irecv().

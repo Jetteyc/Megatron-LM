@@ -3,6 +3,9 @@
 import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+import logging
+import os
+import sys
 from typing import Callable, Optional
 
 import torch
@@ -11,6 +14,30 @@ from torch.autograd import Variable
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank, make_viewless_tensor
 
 logger = logging.getLogger(__name__)
+
+try:
+    from megatron.core.network_engine import get_global_network_engine
+    from megatron.core.network_engine.enums import ParallelDomain
+except Exception:
+    get_global_network_engine = None
+    ParallelDomain = None
+
+
+def _record_function_is_enabled() -> bool:
+    return os.getenv("NE_RECORD_FUNCTION_DISABLE", "0") != "1"
+
+
+def _schedule_node_record_function_is_enabled() -> bool:
+    return os.getenv("NE_SCHEDULE_NODE_RECORD_FUNCTION_ENABLE", "0") == "1"
+
+
+@contextmanager
+def _cpu_profiler_range(name: str):
+    if _record_function_is_enabled() and _schedule_node_record_function_is_enabled():
+        with torch.profiler.record_function(name):
+            yield
+    else:
+        yield
 
 
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
@@ -209,25 +236,24 @@ class ScheduleNode:
 
     def _forward(self, *inputs):
         with stream_acquire_context(self.stream, self.event):
-            torch.cuda.nvtx.range_push(f"{self.name} forward")
-            with torch.cuda.stream(self.stream):
-                self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
-                for i, input in enumerate(self.inputs):
-                    if input is not None:
-                        input.requires_grad = inputs[i].requires_grad
+            with _cpu_profiler_range(f"{self.name} forward"):
+                with torch.cuda.stream(self.stream):
+                    self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
+                    for i, input in enumerate(self.inputs):
+                        if input is not None:
+                            input.requires_grad = inputs[i].requires_grad
 
-                data = tuple(self.inputs)
-                data = self.forward_func(*data)
+                    data = tuple(self.inputs)
+                    data = self.forward_func(*data)
 
-                if not isinstance(data, tuple):
-                    data = make_viewless(data)
-                else:
-                    data = tuple(
-                        [make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data]
-                    )
+                    if not isinstance(data, tuple):
+                        data = make_viewless(data)
+                    else:
+                        data = tuple(
+                            [make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data]
+                        )
 
-                self.output = data
-            torch.cuda.nvtx.range_pop()
+                    self.output = data
 
         # Immediately frees input tensors after they are used for nodes
         # where inputs are no longer needed after computation.
@@ -251,17 +277,16 @@ class ScheduleNode:
 
     def _backward(self, *output_grad):
         with stream_acquire_context(self.stream, self.event):
-            torch.cuda.nvtx.range_push(f"{self.name} backward")
-            with torch.cuda.stream(self.stream):
-                outputs = self.output
-                if not isinstance(outputs, tuple):
-                    outputs = (outputs,)
-                assert len(outputs) == len(output_grad), (
-                    f"{len(outputs)} of {type(outputs[0])} is not equal to "
-                    f"{len(output_grad)} of {type(output_grad[0])}"
-                )
-                output_grad = self.backward_func(outputs, output_grad)
-            torch.cuda.nvtx.range_pop()
+            with _cpu_profiler_range(f"{self.name} backward"):
+                with torch.cuda.stream(self.stream):
+                    outputs = self.output
+                    if not isinstance(outputs, tuple):
+                        outputs = (outputs,)
+                    assert len(outputs) == len(output_grad), (
+                        f"{len(outputs)} of {type(outputs[0])} is not equal to "
+                        f"{len(output_grad)} of {type(output_grad[0])}"
+                    )
+                    output_grad = self.backward_func(outputs, output_grad)
 
         # output_grad maybe from another stream
         if output_grad:
@@ -316,25 +341,93 @@ class AbstractSchedulePlan(ABC):
         """
         ...
 
+    @classmethod
+    def is_backward_deferred(cls):
+        """Return True if the schedule defers backward completion to the next run() call.
+
+        When True, the caller should NOT read input_tensor.grad immediately after run()
+        returns, because the backward through the first layer has not finished yet.
+        The deferred backward will be completed at the beginning of the next run() call
+        (or by an explicit flush_pending_backward() call at the end of steady state).
+        """
+        return False
+
+    @staticmethod
+    def flush_pending_backward():
+        """Flush any pending deferred backward state.
+
+        This is a no-op for schedule plans that do not defer backward.
+        Staggered schedules override this to complete the last microbatch's backward.
+        """
+        pass
+
 
 _COMP_STREAM = None
 _COMM_STREAM = None
+_COMM_STREAM_FALLBACK_WARNED = False
 
 
 def set_streams(comp_stream=None, comm_stream=None):
     """Set the streams for communication and computation"""
     global _COMP_STREAM
     global _COMM_STREAM
+    global _COMM_STREAM_FALLBACK_WARNED
     if _COMP_STREAM is not None and _COMM_STREAM is not None:
         return
 
     if comp_stream is None:
         comp_stream = torch.cuda.current_stream()
     if comm_stream is None:
-        comm_stream = torch.cuda.Stream(device="cuda")
+        use_staggered_comm_stream = os.getenv("STAGGERED_1F1B", "0") == "1"
+        if use_staggered_comm_stream:
+            ne_stream = None
+            fallback_reason = None
+            if get_global_network_engine is not None and ParallelDomain is not None:
+                try:
+                    pp_group = None
+                    if torch.distributed.is_available() and torch.distributed.is_initialized():
+                        from megatron.core import parallel_state
+
+                        pp_group = parallel_state.get_pipeline_model_parallel_group(
+                            check_initialized=False
+                        )
+                    ne_stream = get_global_network_engine().get_comm_stream_for_domain(
+                        domain=ParallelDomain.PP,
+                        group=pp_group,
+                        intranode=None,
+                    )
+                except Exception as exc:
+                    ne_stream = None
+                    fallback_reason = f"exception={type(exc).__name__}: {exc}"
+            comm_stream = ne_stream
+            if ne_stream is None and not _COMM_STREAM_FALLBACK_WARNED:
+                _COMM_STREAM_FALLBACK_WARNED = True
+                if fallback_reason is None:
+                    if get_global_network_engine is None or ParallelDomain is None:
+                        fallback_reason = "network_engine import unavailable"
+                    else:
+                        fallback_reason = "network_engine returned no stream"
+                msg = (
+                    "[NetworkEngine][Fallback] pipeline_parallel.set_streams failed to get "
+                    "network_engine comm stream; "
+                    f"reason={fallback_reason}"
+                )
+                logging.getLogger(__name__).warning(msg)
+                print(msg, file=sys.stderr)
+            if comm_stream is None:
+                raise RuntimeError(
+                    "pipeline_parallel.set_streams requires network_engine comm stream for PP "
+                    "(strict stream ownership mode)"
+                )
+        else:
+            comm_stream = torch.cuda.Stream(device="cuda")
 
     assert _COMP_STREAM is None
     assert _COMM_STREAM is None
+    try:
+        torch.cuda.set_stream_add_label(comp_stream, "NE_compute_stream")
+    except AttributeError:
+        pass
     _COMP_STREAM = comp_stream
     _COMM_STREAM = comm_stream
 

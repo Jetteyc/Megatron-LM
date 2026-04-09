@@ -185,16 +185,31 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
         input_tensor = forward_step_helper_preprocess(
             f_virtual_microbatch_id, f_model_chunk_id, f_microbatch_id
         )
+    is_steady_state = (
+        f_virtual_microbatch_id is not None and b_virtual_microbatch_id is not None
+    )
     # backward prepare
     b_model_chunk_id = None
     b_input_tensor = None
     b_output_tensor = None
     b_output_tensor_grad = None
+    b_output_tensor_grad_deferred = False
+    b_schedule_plan_type = None
     if b_virtual_microbatch_id is not None:
         b_model_chunk_id = get_model_chunk_id(b_virtual_microbatch_id, forward=False)
         b_input_tensor, b_output_tensor, b_output_tensor_grad = backward_step_helper_preprocess(
             b_virtual_microbatch_id, b_model_chunk_id
         )
+        b_schedule_plan = getattr(b_output_tensor, 'schedule_plan', None) if b_output_tensor is not None else None
+        b_schedule_plan_type = type(b_schedule_plan) if b_schedule_plan is not None else None
+        # _DEFERRED_GRAD only applies to staggered steady state.
+        from megatron.core.pipeline_parallel.schedules import _DEFERRED_GRAD
+        if b_output_tensor_grad is _DEFERRED_GRAD:
+            if is_steady_state:
+                b_output_tensor_grad = None
+                b_output_tensor_grad_deferred = True
+            else:
+                b_output_tensor_grad = None
     # Call combined forward and backward step to overlap the communication and computation
     output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
         forward_step_func,
@@ -221,16 +236,27 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
             else None
         ),
         current_microbatch=f_microbatch_id,
+        b_output_tensor_grad_deferred=b_output_tensor_grad_deferred,
     )
+    # Retrieve schedule plan references for deferred-backward checks.
+    f_schedule_plan = getattr(output_tensor, 'schedule_plan', None) if output_tensor is not None else None
+    schedule_plan_type = type(f_schedule_plan) if f_schedule_plan is not None else b_schedule_plan_type
+
     # forward post process
     if f_model_chunk_id is not None:
         forward_step_helper_postprocess(f_model_chunk_id, output_tensor, num_tokens)
     # backward post process
-    if b_model_chunk_id:
+    if b_model_chunk_id is not None:
         # The same as the backward_step_helper
         backward_step_helper_postprocess(b_virtual_microbatch_id)
-        if input_tensor is not None:
-            assert input_tensor_grad is not None
+        backward_actually_deferred = (
+            schedule_plan_type is not None
+            and schedule_plan_type.is_backward_deferred()
+            and is_steady_state
+        )
+        if not backward_actually_deferred:
+            if b_input_tensor is not None:
+                assert input_tensor_grad is not None
     return output_tensor, input_tensor_grad
 
 
@@ -256,6 +282,7 @@ def combined_forward_backward_step(
     is_first_microbatch=False,
     current_microbatch=None,
     encoder_decoder_xattn=False,
+    b_output_tensor_grad_deferred=False,
 ):
     """Merged forward and backward step for combined 1f1b scheduler.
 
@@ -370,7 +397,7 @@ def combined_forward_backward_step(
         loss_node = b_output_tensor[0].loss_func
         b_output_tensor[0].loss_func = None
 
-        if b_output_tensor_grad[0] is None:
+        if not b_output_tensor_grad_deferred and b_output_tensor_grad[0] is None:
             if config.grad_scale_func is not None:
                 b_output_tensor[0] = config.grad_scale_func(b_output_tensor[0])
             # Backward pass for loss function
@@ -429,16 +456,25 @@ def combined_forward_backward_step(
     # backward post process, the same as the backward_step()
     input_tensor_grad = None
     if b_model is not None:
-        input_tensor_grad = [None]
-        if b_input_tensor is not None:
-            input_tensor_grad = []
-            for x in b_input_tensor:
-                if x is None:
-                    input_tensor_grad.append(None)
-                else:
-                    input_tensor_grad.append(x.grad)
+        schedule_plan_type = type(f_schedule_plan or b_schedule_plan)
+        backward_actually_deferred = (
+            schedule_plan_type.is_backward_deferred()
+            and f_schedule_plan is not None
+            and b_schedule_plan is not None
+        )
+        if backward_actually_deferred:
+            input_tensor_grad = None
+        else:
+            input_tensor_grad = [None]
+            if b_input_tensor is not None:
+                input_tensor_grad = []
+                for x in b_input_tensor:
+                    if x is None:
+                        input_tensor_grad.append(None)
+                    else:
+                        input_tensor_grad.append(x.grad)
 
-        if unwrap_input_tensor_grad:
-            input_tensor_grad = input_tensor_grad[0]
+            if unwrap_input_tensor_grad:
+                input_tensor_grad = input_tensor_grad[0]
 
     return output_tensor, num_tokens, input_tensor_grad
