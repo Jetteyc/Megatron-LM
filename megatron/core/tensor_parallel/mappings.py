@@ -5,7 +5,10 @@ import os
 
 import torch
 
-from megatron.core.network_engine import get_global_network_engine
+from megatron.core.network_engine import (
+    get_global_network_engine,
+    is_network_engine_stream_ownership_enabled,
+)
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_global_memory_buffer,
@@ -28,7 +31,10 @@ def _ne_stream_ctx(domain, group):
     stream resolution fails, so the caller always falls back to the
     default stream.
     """
-    if os.getenv("STAGGERED_1F1B", "0") != "1":
+    if (
+        os.getenv("STAGGERED_1F1B", "0") != "1"
+        or not is_network_engine_stream_ownership_enabled()
+    ):
         return nullcontext()
     try:
         ne = get_global_network_engine()

@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+import sys
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -11,6 +12,68 @@ from megatron.core.utils import nvtx_decorator
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+def _p2p_debug_enabled() -> bool:
+    return os.environ.get('STAGGERED_1F1B_TEST_DEBUG', '1') != '0'
+
+
+def _p2p_debug_log(message: str) -> None:
+    if not _p2p_debug_enabled():
+        return
+    rank = os.environ.get('RANK', '?')
+    local_rank = os.environ.get('LOCAL_RANK', '?')
+    print(
+        f"[pp_p2p][rank={rank}][local_rank={local_rank}] {message}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _format_p2p_debug_context(
+    *,
+    group: torch.distributed.ProcessGroup,
+    prev_pipeline_rank: int,
+    next_pipeline_rank: int,
+    tensor_shape: Shape,
+    recv_prev: bool,
+    recv_next: bool,
+    tensor_send_prev: Optional[torch.Tensor],
+    tensor_send_next: Optional[torch.Tensor],
+) -> str:
+    """Build a compact debug string for PP P2P failures."""
+    try:
+        group_ranks = list(torch.distributed.get_process_group_ranks(group))
+    except Exception:
+        group_ranks = None
+
+    try:
+        current_rank = torch.distributed.get_rank()
+    except Exception:
+        current_rank = None
+
+    try:
+        group_rank = group.rank()
+    except Exception:
+        group_rank = None
+
+    try:
+        group_size = group.size()
+    except Exception:
+        group_size = None
+
+    send_prev_shape = tuple(tensor_send_prev.shape) if tensor_send_prev is not None else None
+    send_next_shape = tuple(tensor_send_next.shape) if tensor_send_next is not None else None
+
+    return (
+        "pp_p2p_context("
+        f"current_rank={current_rank}, group_rank={group_rank}, group_size={group_size}, "
+        f"group_ranks={group_ranks}, prev_pipeline_rank={prev_pipeline_rank}, "
+        f"next_pipeline_rank={next_pipeline_rank}, tensor_shape={tensor_shape}, "
+        f"recv_prev={recv_prev}, recv_next={recv_next}, "
+        f"tensor_send_prev_shape={send_prev_shape}, tensor_send_next_shape={send_next_shape}"
+        ")"
+    )
 
 
 def _batched_p2p_ops(
@@ -170,11 +233,14 @@ class P2PCommunicator:
         use_dedicated_pp_stream = os.getenv("STAGGERED_1F1B", "0") == "1"
         if use_dedicated_pp_stream:
             try:
-                from megatron.core.network_engine import get_global_network_engine
+                from megatron.core.network_engine import (
+                    get_global_network_engine,
+                    is_network_engine_stream_ownership_enabled,
+                )
                 from megatron.core.network_engine.enums import ParallelDomain
 
                 ne = get_global_network_engine()
-                if ne is not None:
+                if ne is not None and is_network_engine_stream_ownership_enabled():
                     self._pp_stream = ne.get_comm_stream_for_domain(
                         domain=ParallelDomain.PP,
                         group=pp_group,
@@ -399,15 +465,30 @@ class P2PCommunicator:
             if tensor_recv_next_func is not None:
                 tensor_recv_next = tensor_recv_next_func()
 
-            p2p_reqs = p2p_func(
-                tensor_send_prev=tensor_send_prev,
-                tensor_recv_prev=tensor_recv_prev,
-                tensor_send_next=tensor_send_next,
-                tensor_recv_next=tensor_recv_next,
-                group=pp_group,
-                prev_pipeline_rank=prev_rank,
-                next_pipeline_rank=next_rank,
-            )
+            try:
+                p2p_reqs = p2p_func(
+                    tensor_send_prev=tensor_send_prev,
+                    tensor_recv_prev=tensor_recv_prev,
+                    tensor_send_next=tensor_send_next,
+                    tensor_recv_next=tensor_recv_next,
+                    group=pp_group,
+                    prev_pipeline_rank=prev_rank,
+                    next_pipeline_rank=next_rank,
+                )
+            except Exception as exc:
+                debug_context = _format_p2p_debug_context(
+                    group=pp_group,
+                    prev_pipeline_rank=prev_rank,
+                    next_pipeline_rank=next_rank,
+                    tensor_shape=tensor_shape,
+                    recv_prev=recv_prev,
+                    recv_next=recv_next,
+                    tensor_send_prev=tensor_send_prev,
+                    tensor_send_next=tensor_send_next,
+                )
+                raise RuntimeError(
+                    f"PP P2P communicate failed: {debug_context}"
+                ) from exc
             if isinstance(p2p_reqs, list):
                 reqs.extend(p2p_reqs)
             else:
@@ -435,6 +516,9 @@ class P2PCommunicator:
         self, tensor_shapes, is_first_stage: bool
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
         """Receive tensor from previous rank in pipeline (forward receive)."""
+        _p2p_debug_log(
+            f"recv_forward ENTER is_first_stage={is_first_stage} tensor_shapes={tensor_shapes}"
+        )
         unwrap_tensor_shapes = False
         if is_single_shape(tensor_shapes):
             unwrap_tensor_shapes = True
@@ -458,7 +542,13 @@ class P2PCommunicator:
                     config.timers('forward-recv').stop()
             input_tensors.append(input_tensor)
         if unwrap_tensor_shapes:
+            _p2p_debug_log(
+                f"recv_forward DONE is_first_stage={is_first_stage} returned_single={input_tensors[0] is not None}"
+            )
             return input_tensors[0]
+        _p2p_debug_log(
+            f"recv_forward DONE is_first_stage={is_first_stage} returned_count={len(input_tensors)}"
+        )
         return input_tensors
 
     @nvtx_decorator()
@@ -466,6 +556,9 @@ class P2PCommunicator:
         self, tensor_shapes, is_last_stage: bool
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
         """Receive tensor from next rank in pipeline (backward receive)."""
+        _p2p_debug_log(
+            f"recv_backward ENTER is_last_stage={is_last_stage} tensor_shapes={tensor_shapes}"
+        )
         unwrap_tensor_shapes = False
         if is_single_shape(tensor_shapes):
             unwrap_tensor_shapes = True
@@ -489,12 +582,21 @@ class P2PCommunicator:
                     config.timers('backward-recv').stop()
             output_tensor_grads.append(output_tensor_grad)
         if unwrap_tensor_shapes:
+            _p2p_debug_log(
+                f"recv_backward DONE is_last_stage={is_last_stage} returned_single={output_tensor_grads[0] is not None}"
+            )
             return output_tensor_grads[0]
+        _p2p_debug_log(
+            f"recv_backward DONE is_last_stage={is_last_stage} returned_count={len(output_tensor_grads)}"
+        )
         return output_tensor_grads
 
     @nvtx_decorator()
     def send_forward(self, output_tensors, is_last_stage: bool) -> None:
         """Send tensor to next rank in pipeline (forward send)."""
+        _p2p_debug_log(
+            f"send_forward ENTER is_last_stage={is_last_stage} tensor_is_list={isinstance(output_tensors, list)}"
+        )
         config = self.config
         if not isinstance(output_tensors, list):
             output_tensors = [output_tensors]
@@ -512,6 +614,7 @@ class P2PCommunicator:
                 )
                 if config.timers is not None:
                     config.timers('forward-send').stop()
+            _p2p_debug_log(f"send_forward DONE is_last_stage={is_last_stage}")
 
     @nvtx_decorator()
     def send_backward(self, input_tensor_grads, is_first_stage: bool) -> None:
@@ -538,6 +641,9 @@ class P2PCommunicator:
         self, output_tensors, tensor_shapes, is_last_stage: bool
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
         """Batched send and recv with next rank in pipeline."""
+        _p2p_debug_log(
+            f"send_forward_recv_backward ENTER is_last_stage={is_last_stage} tensor_shapes={tensor_shapes}"
+        )
         config = self.config
         unwrap_output_tensors = False
         if not isinstance(output_tensors, list):
@@ -563,7 +669,13 @@ class P2PCommunicator:
                     config.timers('forward-send-backward-recv').stop()
             output_tensor_grads.append(output_tensor_grad)
         if unwrap_output_tensors:
+            _p2p_debug_log(
+                f"send_forward_recv_backward DONE is_last_stage={is_last_stage} returned_single={output_tensor_grads[0] is not None}"
+            )
             return output_tensor_grads[0]
+        _p2p_debug_log(
+            f"send_forward_recv_backward DONE is_last_stage={is_last_stage} returned_count={len(output_tensor_grads)}"
+        )
         return output_tensor_grads
 
     @nvtx_decorator()
@@ -571,6 +683,9 @@ class P2PCommunicator:
         self, input_tensor_grads, tensor_shapes, is_first_stage: bool
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
         """Batched send and recv with previous rank in pipeline."""
+        _p2p_debug_log(
+            f"send_backward_recv_forward ENTER is_first_stage={is_first_stage} tensor_shapes={tensor_shapes}"
+        )
         config = self.config
         unwrap_input_tensor_grads = False
         if not isinstance(input_tensor_grads, list):
@@ -596,7 +711,13 @@ class P2PCommunicator:
                     config.timers('backward-send-forward-recv').stop()
             input_tensors.append(input_tensor)
         if unwrap_input_tensor_grads:
+            _p2p_debug_log(
+                f"send_backward_recv_forward DONE is_first_stage={is_first_stage} returned_single={input_tensors[0] is not None}"
+            )
             return input_tensors[0]
+        _p2p_debug_log(
+            f"send_backward_recv_forward DONE is_first_stage={is_first_stage} returned_count={len(input_tensors)}"
+        )
         return input_tensors
 
     @nvtx_decorator()
@@ -608,6 +729,9 @@ class P2PCommunicator:
         overlap_p2p_comm: bool = False,
     ) -> torch.Tensor:
         """Batched recv from previous rank and send to next rank in pipeline."""
+        _p2p_debug_log(
+            f"send_forward_recv_forward ENTER recv_prev={recv_prev} overlap_p2p_comm={overlap_p2p_comm} tensor_shape={tensor_shape} send_next={output_tensor is not None}"
+        )
         config = self.config
         if config.timers is not None:
             config.timers('forward-send-forward-recv', log_level=2).start()
@@ -622,7 +746,13 @@ class P2PCommunicator:
         if config.timers is not None:
             config.timers('forward-send-forward-recv').stop()
         if overlap_p2p_comm:
+            _p2p_debug_log(
+                f"send_forward_recv_forward DONE overlap wait_handles={list(wait_handles.keys()) if wait_handles is not None else None} recv_prev={recv_prev}"
+            )
             return input_tensor, wait_handles
+        _p2p_debug_log(
+            f"send_forward_recv_forward DONE recv_prev={recv_prev} returned_input={input_tensor is not None}"
+        )
         return input_tensor
 
     @nvtx_decorator()
@@ -634,6 +764,9 @@ class P2PCommunicator:
         overlap_p2p_comm: bool = False,
     ) -> torch.Tensor:
         """Batched recv from next rank and send to previous rank in pipeline."""
+        _p2p_debug_log(
+            f"send_backward_recv_backward ENTER recv_next={recv_next} overlap_p2p_comm={overlap_p2p_comm} tensor_shape={tensor_shape} send_prev={input_tensor_grad is not None}"
+        )
         config = self.config
         if config.timers is not None:
             config.timers('backward-send-backward-recv', log_level=2).start()
@@ -648,7 +781,13 @@ class P2PCommunicator:
         if config.timers is not None:
             config.timers('backward-send-backward-recv').stop()
         if overlap_p2p_comm:
+            _p2p_debug_log(
+                f"send_backward_recv_backward DONE overlap wait_handles={list(wait_handles.keys()) if wait_handles is not None else None} recv_next={recv_next}"
+            )
             return output_tensor_grad, wait_handles
+        _p2p_debug_log(
+            f"send_backward_recv_backward DONE recv_next={recv_next} returned_grad={output_tensor_grad is not None}"
+        )
         return output_tensor_grad
 
     @nvtx_decorator()
@@ -661,6 +800,9 @@ class P2PCommunicator:
         tensor_shape: Shape,
     ) -> torch.Tensor:
         """Batched send and recv with previous and next ranks in pipeline."""
+        _p2p_debug_log(
+            f"send_forward_backward_recv_forward_backward ENTER recv_prev={recv_prev} recv_next={recv_next} tensor_shape={tensor_shape} send_next={output_tensor is not None} send_prev={input_tensor_grad is not None}"
+        )
         config = self.config
         if config.timers is not None:
             config.timers('forward-backward-send-forward-backward-recv', log_level=2).start()
@@ -673,4 +815,7 @@ class P2PCommunicator:
         )
         if config.timers is not None:
             config.timers('forward-backward-send-forward-backward-recv').stop()
+        _p2p_debug_log(
+            f"send_forward_backward_recv_forward_backward DONE recv_prev={recv_prev} recv_next={recv_next} returned_input={input_tensor is not None} returned_grad={output_tensor_grad is not None}"
+        )
         return input_tensor, output_tensor_grad

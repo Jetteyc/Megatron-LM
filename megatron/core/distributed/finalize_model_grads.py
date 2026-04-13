@@ -8,7 +8,10 @@ from typing import Callable, List, Optional, Union
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-from megatron.core.network_engine import get_global_network_engine
+from megatron.core.network_engine import (
+    get_global_network_engine,
+    is_network_engine_stream_ownership_enabled,
+)
 from megatron.core.network_engine.enums import ParallelDomain
 
 try:
@@ -38,7 +41,10 @@ from ..utils import (
 
 def _ne_stream_ctx(domain, group):
     """Get a ``torch.cuda.stream`` context for *domain* + *group* from NetworkEngine."""
-    if os.getenv("STAGGERED_1F1B", "0") != "1":
+    if (
+        os.getenv("STAGGERED_1F1B", "0") != "1"
+        or not is_network_engine_stream_ownership_enabled()
+    ):
         return nullcontext()
     try:
         ne = get_global_network_engine()

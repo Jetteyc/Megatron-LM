@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from collections import OrderedDict
 from typing import Dict, Literal, Optional
 
@@ -784,9 +785,19 @@ class GPTModel(LanguageModule):
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
 
-        from ..common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
+        from ..common.model_chunk_schedule_plan import (
+            StaggeredTransformerModelChunkSchedulePlan,
+            TransformerModelChunkSchedulePlan,
+        )
 
-        return TransformerModelChunkSchedulePlan(
+        schedule_plan_cls = TransformerModelChunkSchedulePlan
+        if (
+            os.getenv('STAGGERED_1F1B', '0') == '1'
+            and self.config.overlap_moe_expert_parallel_comm
+        ):
+            schedule_plan_cls = StaggeredTransformerModelChunkSchedulePlan
+
+        return schedule_plan_cls(
             self,
             input_ids,
             position_ids,

@@ -1,6 +1,7 @@
 __pycache__
 *.so
 build
+outputs/
 .coverage_*
 *.egg-info
 *~

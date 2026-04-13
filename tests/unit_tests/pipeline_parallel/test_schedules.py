@@ -43,10 +43,12 @@ rank = Utils.rank
 
 
 _DEFAULT_QWEN_MODEL_DIR = "/data/common/models/Qwen/Qwen3-30B-A3B-Base_8layers"
-_DEFAULT_STRUCTURAL_SEQ_LENGTH = 2048
+# _DEFAULT_STRUCTURAL_SEQ_LENGTH = 2048
+_DEFAULT_STRUCTURAL_SEQ_LENGTH = 128
 _DEFAULT_STRUCTURAL_MICRO_BATCH_SIZE = 2
 _DEFAULT_STRUCTURAL_NUM_MICROBATCHES = 32
-_DEFAULT_STRUCTURAL_VOCAB_SIZE_CAP = 65536
+# _DEFAULT_STRUCTURAL_VOCAB_SIZE_CAP = 65536
+_DEFAULT_STRUCTURAL_VOCAB_SIZE_CAP = 1024
 
 
 def _debug_log(message):
@@ -59,6 +61,26 @@ def _debug_log(message):
         file=sys.stderr,
         flush=True,
     )
+
+
+def _describe_debug_value(value):
+    if torch.is_tensor(value):
+        return (
+            f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, "
+            f"device={value.device}, requires_grad={value.requires_grad})"
+        )
+    if isinstance(value, (list, tuple)):
+        preview = ', '.join(_describe_debug_value(item) for item in value[:2])
+        if len(value) > 2:
+            preview += ', ...'
+        return f"{type(value).__name__}(len={len(value)}[{preview}])"
+    if isinstance(value, dict):
+        items = list(value.items())[:2]
+        preview = ', '.join(f"{key}={_describe_debug_value(val)}" for key, val in items)
+        if len(value) > 2:
+            preview += ', ...'
+        return f"dict({preview})"
+    return type(value).__name__
 
 
 class _ScheduleTestGPTModel(GPTModel):
@@ -1067,6 +1089,15 @@ def _run_1f1b_profiler_with_5d_parallel(
         f"overlap_moe_expert_parallel_comm={overlap_moe_expert_parallel_comm}"
     )
 
+    disable_ne_stream_ownership = (not use_staggered) and (not overlap_moe_expert_parallel_comm)
+    os.environ['MEGATRON_DISABLE_NETWORK_ENGINE_STREAM_OWNERSHIP'] = (
+        '1' if disable_ne_stream_ownership else '0'
+    )
+    _debug_log(
+        "network_engine_stream_ownership="
+        f"{'disabled' if disable_ne_stream_ownership else 'enabled'}"
+    )
+
     _initialize_model_parallel_for_torchrun(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
@@ -1085,19 +1116,25 @@ def _run_1f1b_profiler_with_5d_parallel(
     )
 
     ne = get_global_network_engine()
-    pp_group = parallel_state.get_pipeline_model_parallel_group(check_initialized=False)
-    _, pp_traffic = ne.resolve_for_group(
-        domain=ParallelDomain.PP,
-        group=pp_group,
-        intranode=None,
-    )
-    pp_stream = ne.streams.get_stream(pp_traffic)
-    _debug_log(
-        f"pp stream resolved traffic={pp_traffic} pp_stream={pp_stream} global_comm_stream={get_comm_stream()}"
-    )
-    assert pp_stream is not None
-    assert get_comm_stream() is not None
-    assert pp_stream == ne.streams.get_stream(TrafficClass.INTERNODE)
+    if not disable_ne_stream_ownership:
+        pp_group = parallel_state.get_pipeline_model_parallel_group(check_initialized=False)
+        _, pp_traffic = ne.resolve_for_group(
+            domain=ParallelDomain.PP,
+            group=pp_group,
+            intranode=None,
+        )
+        pp_stream = ne.streams.get_stream(pp_traffic)
+        _debug_log(
+            f"pp stream resolved traffic={pp_traffic} pp_stream={pp_stream} global_comm_stream={get_comm_stream()}"
+        )
+        assert pp_stream is not None
+        assert get_comm_stream() is not None
+        assert pp_stream == ne.streams.get_stream(TrafficClass.INTERNODE)
+    else:
+        _debug_log(
+            f"pp stream ownership bypassed global_comm_stream={get_comm_stream()}"
+        )
+        assert get_comm_stream() is not None
 
     tp_backend, tp_traffic = ne.resolve(ParallelDomain.TP, intranode=True)
     cp_backend, cp_traffic = ne.resolve(ParallelDomain.CP, intranode=True)
@@ -1230,7 +1267,21 @@ def _run_1f1b_profiler_with_5d_parallel(
         )
         if return_schedule_plan:
             return schedule_plan, loss_func
-        return model_chunk(**batch), loss_func
+        _debug_log(
+            f"model forward BEGIN chunk={type(model_chunk).__name__} "
+            f"vp_stage={getattr(schedule_plan, 'vp_stage', 'na')}"
+        )
+        try:
+            model_output = model_chunk(**batch)
+        except Exception as exc:
+            _debug_log(f"model forward failed: {type(exc).__name__}: {exc}")
+            _debug_log(traceback.format_exc())
+            raise
+        _debug_log(
+            f"model forward DONE chunk={type(model_chunk).__name__} "
+            f"output={_describe_debug_value(model_output)}"
+        )
+        return model_output, loss_func
 
     unit_wall_times_ms = []
     unit_gpu_times_ms = []

@@ -12,7 +12,7 @@ from typing import Callable, List, Optional
 import numpy as np
 import torch
 
-from .utils import GlobalSymmetricMemoryBuffer, is_torch_min_version
+from .utils import GlobalMemoryBuffer, GlobalSymmetricMemoryBuffer, is_torch_min_version
 
 try:
     from megatron.core.network_engine import get_global_network_engine

@@ -1,3 +1,5 @@
+import os
+
 from .backends import (
     BaseCommBackend,
     DeepEPBackend,
@@ -21,6 +23,10 @@ from .scheduler import (
     get_scheduler_stream_pool,
 )
 
+
+def is_network_engine_stream_ownership_enabled() -> bool:
+    return os.getenv("MEGATRON_DISABLE_NETWORK_ENGINE_STREAM_OWNERSHIP", "0") != "1"
+
 __all__ = [
     # Engine
     "NetworkEngine",
@@ -30,6 +36,7 @@ __all__ = [
     "BackendDecision",
     "get_global_network_engine",
     "resolve_cp_backend_name_for_ranks",
+    "is_network_engine_stream_ownership_enabled",
     # Backends
     "BaseCommBackend",
     "TorchDistributedBackend",

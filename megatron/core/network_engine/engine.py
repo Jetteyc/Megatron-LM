@@ -664,6 +664,16 @@ class NetworkEngine:
         the domain stream is unavailable.
         """
         global _P2P_STREAM_SELECT_LOG_COUNT
+
+        # CP attention in TransformerEngine already carries a domain-owned
+        # `cp_stream` through the full algorithm and synchronizes against that
+        # single stream. Returning a peer-specific stream here would create a
+        # second stream source for the same CP operation and break the current
+        # synchronization model. In that case, let callers fall back to their
+        # existing CP stream.
+        if domain == ParallelDomain.CP:
+            return None
+
         if local_rank is None:
             if not torch.distributed.is_available() or not torch.distributed.is_initialized():
                 return None

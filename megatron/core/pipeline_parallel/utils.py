@@ -16,10 +16,14 @@ from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank, make_
 logger = logging.getLogger(__name__)
 
 try:
-    from megatron.core.network_engine import get_global_network_engine
+    from megatron.core.network_engine import (
+        get_global_network_engine,
+        is_network_engine_stream_ownership_enabled,
+    )
     from megatron.core.network_engine.enums import ParallelDomain
 except Exception:
     get_global_network_engine = None
+    is_network_engine_stream_ownership_enabled = None
     ParallelDomain = None
 
 
@@ -378,7 +382,13 @@ def set_streams(comp_stream=None, comm_stream=None):
     if comp_stream is None:
         comp_stream = torch.cuda.current_stream()
     if comm_stream is None:
-        use_staggered_comm_stream = os.getenv("STAGGERED_1F1B", "0") == "1"
+        ownership_enabled = (
+            is_network_engine_stream_ownership_enabled is None
+            or is_network_engine_stream_ownership_enabled()
+        )
+        use_staggered_comm_stream = (
+            ownership_enabled and os.getenv("STAGGERED_1F1B", "0") == "1"
+        )
         if use_staggered_comm_stream:
             ne_stream = None
             fallback_reason = None

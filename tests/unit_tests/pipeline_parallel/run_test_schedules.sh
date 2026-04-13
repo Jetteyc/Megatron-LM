@@ -15,7 +15,7 @@ elif [[ -f "${WORKSPACE_ROOT}/.secrets/env.sh" ]]; then
 fi
 
 NNODES=2
-NODE_RANK=0
+NODE_RANK=${NODE_RANK:-0}
 MASTER_ADDR=10.156.154.35
 MASTER_PORT=29500
 
@@ -27,15 +27,15 @@ TP_INTRANODE_BACKEND=torch_dist
 PP_INTERNODE_BACKEND=torch_dist
 DP_INTERNODE_BACKEND=torch_dist
 
-STAGGERED_1F1B=1
+STAGGERED_1F1B=
 DELAY_WGRAD_COMPUTE=1
 NE_NVTX_DISABLE=1
 NE_SCHEDULE_NVTX_ENABLE=0
 NE_SCHEDULE_NODE_RECORD_FUNCTION_ENABLE=0
-NE_STAGGERED_1F1B_LOG=0
+NE_STAGGERED_1F1B_LOG=1
 NE_STAGGERED_1F1B_LOG_MAX_CALLS=128
-NE_STAGGERED_1F1B_DEBUG=0
-STAGGERED_1F1B_TEST_DEBUG=0
+NE_STAGGERED_1F1B_DEBUG=1
+STAGGERED_1F1B_TEST_DEBUG=1
 
 CUDA_DEVICE_MAX_CONNECTIONS=1
 NVTE_FLASH_ATTN=1
@@ -45,11 +45,42 @@ NVTE_NVTX_ENABLED=0
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
 
 TEST_TARGET=tests/unit_tests/pipeline_parallel/test_schedules.py
-TEST_FILTER=test_staggered_1f1b_profiler_with_5d_parallel
+# TEST_FILTER=test_staggered_1f1b_profiler_with_5d_parallel
 # TEST_FILTER=test_baseline_1f1b_profiler_with_5d_parallel
-# TEST_FILTER=test_interleaved_1f1b_profiler_without_combined_with_5d_parallel
+TEST_FILTER=test_interleaved_1f1b_profiler_without_combined_with_5d_parallel
 # TEST_FILTER="test_baseline_1f1b_profiler_with_5d_parallel or test_staggered_1f1b_profiler_with_5d_parallel or test_interleaved_1f1b_profiler_without_combined_with_5d_parallel"
-PYTEST_ARGS=${PYTEST_ARGS:---tb=long -rA --full-trace}
+PYTEST_ARGS=(
+    -v
+    -s
+    --tb=long
+    -rA
+    --full-trace
+    -o log_cli=true
+    -o log_cli_level=DEBUG
+    -o "log_cli_format=%(asctime)s %(levelname)s %(name)s:%(lineno)d %(message)s"
+    -o "log_cli_date_format=%Y-%m-%d %H:%M:%S"
+    -o log_level=DEBUG
+)
+
+if [[ "${TEST_FILTER}" == "test_interleaved_1f1b_profiler_without_combined_with_5d_parallel" ]]; then
+    MEGATRON_DISABLE_NETWORK_ENGINE_STREAM_OWNERSHIP=1
+else
+    MEGATRON_DISABLE_NETWORK_ENGINE_STREAM_OWNERSHIP=0
+fi
+
+if [[ -z "${STAGGERED_1F1B}" ]]; then
+    case "${TEST_FILTER}" in
+        test_staggered_1f1b_profiler_with_5d_parallel)
+            STAGGERED_1F1B=1
+            ;;
+        test_baseline_1f1b_profiler_with_5d_parallel|test_interleaved_1f1b_profiler_without_combined_with_5d_parallel)
+            STAGGERED_1F1B=0
+            ;;
+        *)
+            STAGGERED_1F1B=1
+            ;;
+    esac
+fi
 
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     IFS=',' read -r -a CUDA_DEVICES <<< "${CUDA_VISIBLE_DEVICES}"
@@ -71,8 +102,13 @@ export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER:-1}
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export TORCH_SHOW_CPP_STACKTRACES=${TORCH_SHOW_CPP_STACKTRACES:-1}
+export TORCH_DISABLE_ADDR2LINE=${TORCH_DISABLE_ADDR2LINE:-1}
+export TORCH_CPP_LOG_LEVEL=${TORCH_CPP_LOG_LEVEL:-INFO}
 export TORCH_DISTRIBUTED_DEBUG=${TORCH_DISTRIBUTED_DEBUG:-DETAIL}
-export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+export NCCL_DEBUG=${NCCL_DEBUG:-INFO}
+export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-ALL}
+export NCCL_DESYNC_DEBUG=${NCCL_DESYNC_DEBUG:-1}
+export MEGATRON_DISABLE_NETWORK_ENGINE_STREAM_OWNERSHIP=${MEGATRON_DISABLE_NETWORK_ENGINE_STREAM_OWNERSHIP:-0}
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 export NVTE_FLASH_ATTN=${NVTE_FLASH_ATTN:-1}
 export NVTE_FUSED_ATTN=${NVTE_FUSED_ATTN:-0}
@@ -86,8 +122,8 @@ export NE_SCHEDULE_NVTX_ENABLE=${NE_SCHEDULE_NVTX_ENABLE:-0}
 export NE_SCHEDULE_NODE_RECORD_FUNCTION_ENABLE=${NE_SCHEDULE_NODE_RECORD_FUNCTION_ENABLE:-0}
 export NE_STAGGERED_1F1B_LOG=${NE_STAGGERED_1F1B_LOG:-0}
 export NE_STAGGERED_1F1B_LOG_MAX_CALLS=${NE_STAGGERED_1F1B_LOG_MAX_CALLS:-128}
-export NE_STAGGERED_1F1B_DEBUG=${NE_STAGGERED_1F1B_DEBUG:-0}
-export STAGGERED_1F1B_TEST_DEBUG=${STAGGERED_1F1B_TEST_DEBUG:-0}
+export NE_STAGGERED_1F1B_DEBUG=${NE_STAGGERED_1F1B_DEBUG:-1}
+export STAGGERED_1F1B_TEST_DEBUG=${STAGGERED_1F1B_TEST_DEBUG:-1}
 
 export CP_INTRANODE_BACKEND=${CP_INTRANODE_BACKEND:-torch_dist}
 export CP_INTERNODE_BACKEND=${CP_INTERNODE_BACKEND:-torch_dist}
@@ -122,9 +158,11 @@ echo "[run_test_schedules] trace_dir(staggered)=${STAGGERED_1F1B_TRACE_DIR}"
 echo "[run_test_schedules] trace_dir(baseline)=${BASELINE_1F1B_TRACE_DIR}"
 echo "[run_test_schedules] trace_dir(interleaved)=${INTERLEAVED_1F1B_TRACE_DIR}"
 echo "[run_test_schedules] test_target=${TEST_TARGET} filter=${TEST_FILTER}"
-echo "[run_test_schedules] pytest_args=${PYTEST_ARGS}"
+echo "[run_test_schedules] pytest_args=${PYTEST_ARGS[*]}"
+echo "[run_test_schedules] staggered_1f1b=${STAGGERED_1F1B}"
 echo "[run_test_schedules] delay_wgrad_compute=${DELAY_WGRAD_COMPUTE}"
-echo "[run_test_schedules] debug: pythonfaulthandler=${PYTHONFAULTHANDLER} torch_cpp_stacks=${TORCH_SHOW_CPP_STACKTRACES} torch_dist_debug=${TORCH_DISTRIBUTED_DEBUG} nccl_debug=${NCCL_DEBUG}"
+echo "[run_test_schedules] debug: pythonfaulthandler=${PYTHONFAULTHANDLER} torch_cpp_stacks=${TORCH_SHOW_CPP_STACKTRACES} torch_disable_addr2line=${TORCH_DISABLE_ADDR2LINE} torch_cpp_log_level=${TORCH_CPP_LOG_LEVEL} torch_dist_debug=${TORCH_DISTRIBUTED_DEBUG} nccl_debug=${NCCL_DEBUG} nccl_debug_subsys=${NCCL_DEBUG_SUBSYS} nccl_desync_debug=${NCCL_DESYNC_DEBUG}"
+echo "[run_test_schedules] network_engine_stream_ownership=${MEGATRON_DISABLE_NETWORK_ENGINE_STREAM_OWNERSHIP} (0=enabled,1=disabled)"
 echo "[run_test_schedules] network_engine_comm_ownership=enabled"
 echo "[run_test_schedules] stream_policy=intranode/internode/all_bandwidth managed by megatron.core.network_engine"
 echo "[run_test_schedules] backends: tp=${TP_INTRANODE_BACKEND} cp_intra=${CP_INTRANODE_BACKEND} cp_inter=${CP_INTERNODE_BACKEND} ep_intra=${EP_INTRANODE_BACKEND} ep_inter=${EP_INTERNODE_BACKEND} pp=${PP_INTERNODE_BACKEND} dp=${DP_INTERNODE_BACKEND}"
@@ -135,4 +173,4 @@ exec torchrun \
     --nproc_per_node="${NPROC_PER_NODE}" \
     --master_addr="${MASTER_ADDR}" \
     --master_port="${MASTER_PORT}" \
-    -m pytest -v -s "${TEST_TARGET}" -k "${TEST_FILTER}" ${PYTEST_ARGS}
+    -m pytest "${TEST_TARGET}" -k "${TEST_FILTER}" "${PYTEST_ARGS[@]}"

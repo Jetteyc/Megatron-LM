@@ -16,7 +16,10 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
-from megatron.core.network_engine import get_global_network_engine
+from megatron.core.network_engine import (
+    get_global_network_engine,
+    is_network_engine_stream_ownership_enabled,
+)
 from megatron.core.network_engine.enums import ParallelDomain
 from megatron.core.transformer.multi_token_prediction import get_mtp_num_layers_to_build
 
@@ -29,6 +32,9 @@ _PP_STREAM_FALLBACK_WARNED = False
 def _resolve_domain_stream(domain: ParallelDomain, fallback_stream):
     global _EP_STREAM_FALLBACK_WARNED
     global _PP_STREAM_FALLBACK_WARNED
+
+    if not is_network_engine_stream_ownership_enabled():
+        return fallback_stream
 
     try:
         group = None
@@ -132,6 +138,7 @@ class TransformerLayerSchedulePlan:
     mlp = None
     moe_combine = None
     mtp_post_process = None
+    _staggered_log_count = 0
 
     def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
         """Initializes a transformer layer schedule plan.
@@ -388,18 +395,14 @@ class StaggeredTransformerLayerSchedulePlan(TransformerLayerSchedulePlan):
 
         if f_layer is not None:
             if should_log:
-                logger.info("[Staggered1F1B] part1 fwd: attn + post_attn")
+                logger.info("[Staggered1F1B] part1 fwd: attn")
             with f_layer.get_fp8_context():
                 with _torch_profiler_range("ATTN(F)"):
                     f_input = f_layer.attn.forward(f_input)
-                with _torch_profiler_range("POST_ATTN(F)"):
-                    f_input = f_layer.post_attn.forward(f_input)
 
         if b_layer is not None:
             if should_log:
-                logger.info("[Staggered1F1B] part1 bwd: post_attn + attn")
-            with _torch_profiler_range("POST_ATTN(B)"):
-                b_grad = b_layer.post_attn.backward(b_grad)
+                logger.info("[Staggered1F1B] part1 bwd: attn")
             with _torch_profiler_range("ATTN(B)"):
                 b_grad = b_layer.attn.backward(b_grad)
 
@@ -524,6 +527,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     └── post_process: PostProcessNode
     """
 
+    _layer_schedule_plan_cls = TransformerLayerSchedulePlan
+
     def __init__(
         self,
         model,
@@ -598,8 +603,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # build layer schedule plan for each layer.
         # The methods to obtain layers are different for MTP so we need the other build plan for
         # MTP. Also, this can help annotate MTP layer so that it can know where MTP is.
-        self._build_layer_schedule_plan(model.decoder, comp_stream, comm_stream)
-        self._build_layer_schedule_plan(getattr(model, "mtp", None), comp_stream, comm_stream)
+        self._build_layer_schedule_plan(model.decoder, comp_stream, layer_comm_stream)
+        self._build_layer_schedule_plan(getattr(model, "mtp", None), comp_stream, layer_comm_stream)
 
         # build post process
         if model.post_process:
@@ -616,7 +621,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 "is_first_layer": layer_idx == 0,
                 "is_last_layer": layer_idx == num_layers - 1,
             }
-            layer_plan = TransformerLayerSchedulePlan(
+            layer_plan = self._layer_schedule_plan_cls(
                 module.layers[layer_idx],
                 self.event,
                 self.state,
@@ -820,7 +825,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
 
 class StaggeredTransformerModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
-    
+
+    _layer_schedule_plan_cls = StaggeredTransformerLayerSchedulePlan
     _pending_bwd_state = None
 
     @classmethod
