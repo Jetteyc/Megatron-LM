@@ -1,27 +1,72 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-
+import json
 import os
+import sys
+import time
+import traceback
+from datetime import timedelta
 
 import pytest
 import torch
 import torch.distributed as dist
 from packaging import version
-from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
-from megatron.core import ModelParallelConfig
+from megatron.core import ModelParallelConfig, parallel_state
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
-from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.pipeline_parallel.utils import (
+    get_comm_stream,
+    is_pp_first_stage,
+    is_pp_last_stage,
+    set_streams,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import (
     convert_schedule_table_to_order,
     get_overlap_moe_expert_parallel_comm_order,
 )
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+_DEFAULT_QWEN_MODEL_DIR = '/data/common/models/Qwen/Qwen3-30B-A3B-Base_8layers'
+
+_SCHEDULE_TEST_MODEL_PARAM_OVERRIDES = {
+    'seq_length': 2048,
+    'micro_batch_size': 1,
+    'hidden_size': 768,
+    'num_attention_heads': 12,
+    'ffn_hidden_size': 2048,
+    'moe_ffn_hidden_size': 384,
+    'num_microbatches': 16,
+    'vocab_size': 8192,
+    'num_moe_experts': 32,
+}
+
+
+def _debug_log(message):
+    if os.environ.get('SCHEDULE_TEST_DEBUG', '1') == '0':
+        return
+    rank = os.environ.get('RANK', '?')
+    local_rank = os.environ.get('LOCAL_RANK', '?')
+    print(
+        f"[schedule_test][rank={rank}][local_rank={local_rank}] {message}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+class _ScheduleTestGPTModel(GPTModel):
+    """Keep a real `GPTModel` instance type for schedule profiler assertions."""
+
+    pass
 
 
 def _populate_embedding_and_position_groups(pp_group):
@@ -38,6 +83,159 @@ def _populate_embedding_and_position_groups(pp_group):
     embd_pg = dist.new_group(ranks=embd_ranks)
 
     return pos_embd_pg, embd_pg
+
+
+def _torchrun_local_rank():
+    return int(os.environ.get('LOCAL_RANK', os.environ.get('RANK', '0')))
+
+
+def _should_enable_deepep(ep_size: int) -> bool:
+    """Decide DeepEP usage from EP backend env vars (mirrors main.py logic).
+
+    When EP_INTRANODE_BACKEND=deepep, use MoEFlexTokenDispatcher with DeepEP;
+    otherwise fall back to alltoall dispatcher with torch.distributed.
+    """
+    if ep_size <= 1:
+        return False
+    return os.environ.get('EP_INTRANODE_BACKEND', '').strip().lower() == 'deepep'
+
+
+def _load_schedule_test_model_params():
+    with open(os.path.join(_DEFAULT_QWEN_MODEL_DIR, 'config.json')) as f:
+        qwen_config = json.load(f)
+
+    model_params = {
+        'model_dir': _DEFAULT_QWEN_MODEL_DIR,
+        'seq_length': 2048,
+        'micro_batch_size': 1,
+        'hidden_size': qwen_config['hidden_size'],
+        'num_layers': qwen_config['num_hidden_layers'],
+        'num_attention_heads': qwen_config['num_attention_heads'],
+        'num_query_groups': qwen_config['num_key_value_heads'],
+        'ffn_hidden_size': qwen_config['intermediate_size'],
+        'moe_ffn_hidden_size': qwen_config.get('moe_intermediate_size', 384),
+        'num_microbatches': 16,
+        'vocab_size': qwen_config['vocab_size'],
+        'num_moe_experts': qwen_config['num_experts'],
+        'moe_router_topk': qwen_config['num_experts_per_tok'],
+        'rotary_base': qwen_config['rope_theta'],
+        'layernorm_epsilon': qwen_config['rms_norm_eps'],
+        'normalization': 'RMSNorm',
+        'gated_linear_unit': True,
+        'activation_func': torch.nn.functional.silu,
+    }
+    model_params.update(_SCHEDULE_TEST_MODEL_PARAM_OVERRIDES)
+    return model_params
+
+
+def _initialize_model_parallel_for_torchrun(
+    *,
+    tensor_model_parallel_size,
+    pipeline_model_parallel_size,
+    virtual_pipeline_model_parallel_size,
+    context_parallel_size,
+    expert_model_parallel_size,
+    expert_tensor_parallel_size=None,
+):
+    local_rank = _torchrun_local_rank()
+    _debug_log(
+        "initialize_model_parallel start "
+        f"tp={tensor_model_parallel_size} pp={pipeline_model_parallel_size} "
+        f"vpp={virtual_pipeline_model_parallel_size} cp={context_parallel_size} "
+        f"ep={expert_model_parallel_size} etp={expert_tensor_parallel_size} local_rank={local_rank}"
+    )
+    torch.cuda.set_device(local_rank % torch.cuda.device_count())
+
+    if not dist.is_initialized():
+        _debug_log("init_process_group begin")
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            timeout=timedelta(minutes=10),
+        )
+        _debug_log("init_process_group done")
+
+    if parallel_state.model_parallel_is_initialized():
+        _debug_log("destroy stale model parallel state")
+        parallel_state.destroy_model_parallel()
+
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        pipeline_model_parallel_size=pipeline_model_parallel_size,
+        virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+        context_parallel_size=context_parallel_size,
+        expert_model_parallel_size=expert_model_parallel_size,
+        expert_tensor_parallel_size=expert_tensor_parallel_size,
+    )
+    _debug_log("initialize_model_parallel done")
+
+
+def _make_profile_batch(seq_length, micro_batch_size, vocab_size):
+    input_ids = torch.arange(seq_length, device='cuda', dtype=torch.int64)
+    _debug_log(f"_make_profile_batch arange done")
+    input_ids = input_ids.unsqueeze(0).repeat(micro_batch_size, 1) % vocab_size
+    position_ids = torch.arange(seq_length, device='cuda', dtype=torch.int64)
+    position_ids = position_ids.unsqueeze(0).repeat(micro_batch_size, 1)
+    attention_mask = torch.ones(
+        (micro_batch_size, 1, seq_length, seq_length),
+        device='cuda',
+        dtype=torch.bool,
+    )
+    _debug_log(f"_make_profile_batch DONE")
+    return {
+        'input_ids': input_ids,
+        'labels': input_ids.clone(),
+        'position_ids': position_ids,
+        'attention_mask': attention_mask,
+    }
+
+
+def _make_profile_data_iterator(num_microbatches, seq_length, micro_batch_size, vocab_size):
+    # Pre-materialize all batches BEFORE pipeline execution starts.
+    # Lazy generation (yield) inside the pipeline loop can trigger CUDA
+    # memory allocation that deadlocks when NCCL streams are active.
+    # All synthetic microbatches are intentionally identical in this test.
+    # Reuse one prebuilt batch payload to avoid multiplying large CUDA tensors
+    # (especially attention masks) by `num_microbatches`.
+    template_batch = _make_profile_batch(seq_length, micro_batch_size, vocab_size)
+    batches = [template_batch.copy() for _ in range(num_microbatches)]
+    return iter(batches)
+
+
+def _build_profile_gpt_model(config, vocab_size, max_sequence_length):
+    model = []
+    vp_size = config.virtual_pipeline_model_parallel_size or 1
+    _debug_log(
+        f"build model start vp_size={vp_size} vocab_size={vocab_size} max_seq={max_sequence_length}"
+    )
+
+    for vp_stage in range(vp_size):
+        block_spec = get_gpt_decoder_block_spec(
+            config=config,
+            use_transformer_engine=True,
+            vp_stage=vp_stage,
+        )
+        pre_process = parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
+        post_process = parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
+        chunk = _ScheduleTestGPTModel(
+            config=config,
+            transformer_layer_spec=block_spec,
+            vocab_size=vocab_size,
+            max_sequence_length=max_sequence_length,
+            pre_process=pre_process,
+            post_process=post_process,
+            position_embedding_type='rope',
+            vp_stage=vp_stage,
+            share_embeddings_and_output_weights=False,
+        )
+        chunk.model_type = 'unit-test'
+        model.append(chunk.bfloat16().cuda())
+        _debug_log(
+            f"build model chunk done vp_stage={vp_stage} pre_process={pre_process} post_process={post_process}"
+        )
+
+    _debug_log(f"build model done num_chunks={len(model)}")
+    return model
 
 
 def test_get_forward_backward_func():
@@ -768,3 +966,392 @@ def test_forward_backward_no_pipelining_with_custom_pgs(mocker):
         assert l['loss_reduced'] == expected['loss_reduced']
 
     Utils.destroy_model_parallel()
+
+
+def _run_1f1b_profiler_with_5d_parallel(
+    mocker,
+    *,
+    overlap_moe_expert_parallel_comm: bool = True,
+):
+    """Shared implementation for 5D-parallel 1F1B profiler tests.
+
+    Args:
+        mocker: pytest-mock fixture.
+        overlap_moe_expert_parallel_comm: Whether to use the combined forward/backward
+            path for MoE EP overlap. When False, this keeps interleaved 1F1B pipeline
+            scheduling enabled but uses the conventional non-combined path.
+    """
+    if 'RANK' not in os.environ and 'LOCAL_RANK' not in os.environ:
+        pytest.skip("This test is intended to run under torchrun")
+
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    if world_size < 8 or world_size % 8 != 0:
+        pytest.skip("Requires WORLD_SIZE to be a multiple of 8 for tp=2, cp=2, ep=2, pp=2")
+
+    from megatron.core.enums import ModelType
+    from megatron.core.pipeline_parallel import get_forward_backward_func
+
+    tag = "baseline" if overlap_moe_expert_parallel_comm else "interleaved"
+
+    tp_size = 2
+    cp_size = 2
+    ep_size = 4
+    etp_size = 1
+    pp_size = 2
+    vpp_size = 2
+    model_params = _load_schedule_test_model_params()
+    seq_length = model_params['seq_length']
+    micro_batch_size = model_params['micro_batch_size']
+    hidden_size = model_params['hidden_size']
+    num_microbatches = model_params['num_microbatches']
+    vocab_size = model_params['vocab_size']
+    num_warmup_steps = 2
+    num_profile_steps = 3
+    total_steps = num_warmup_steps + num_profile_steps
+
+    _debug_log(
+        f"{tag} test start "
+        f"world_size={world_size} tp={tp_size} cp={cp_size} ep={ep_size} pp={pp_size} vpp={vpp_size}"
+    )
+    if model_params['model_dir'] is not None:
+        _debug_log(f"using structural params from {model_params['model_dir']}")
+
+    os.environ.pop('STAGGERED_1F1B', None)
+    os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0'
+    os.environ['NVTE_FLASH_ATTN'] = '1'
+    os.environ['NVTE_FUSED_ATTN'] = '0'
+    os.environ['NVTE_UNFUSED_ATTN'] = '0'
+    _debug_log(
+        f"mode overlap_moe_expert_parallel_comm={overlap_moe_expert_parallel_comm}"
+    )
+
+    _initialize_model_parallel_for_torchrun(
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
+        virtual_pipeline_model_parallel_size=vpp_size,
+        context_parallel_size=cp_size,
+        expert_model_parallel_size=ep_size,
+        expert_tensor_parallel_size=etp_size,
+    )
+    torch.manual_seed(1234)
+    model_parallel_cuda_manual_seed(1234)
+
+    set_streams()
+    _debug_log(
+        f"set_streams done comp_stream={torch.cuda.current_stream()} comm_stream={get_comm_stream()}"
+    )
+
+    use_deepep = _should_enable_deepep(ep_size)
+    moe_dispatcher_type = "flex" if use_deepep else "alltoall"
+    _debug_log(
+        f"EP backend decision: EP_INTRANODE_BACKEND={os.environ.get('EP_INTRANODE_BACKEND', '<unset>')} "
+        f"use_deepep={use_deepep} moe_dispatcher_type={moe_dispatcher_type}"
+    )
+
+    config = TransformerConfig(
+        attention_backend=AttnBackend.flash,
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
+        virtual_pipeline_model_parallel_size=vpp_size,
+        context_parallel_size=cp_size,
+        expert_model_parallel_size=ep_size,
+        expert_tensor_parallel_size=etp_size,
+        deterministic_mode=False,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        num_layers=model_params['num_layers'],
+        hidden_size=hidden_size,
+        num_attention_heads=model_params['num_attention_heads'],
+        ffn_hidden_size=model_params['ffn_hidden_size'],
+        add_bias_linear=False,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        num_moe_experts=model_params['num_moe_experts'],
+        moe_router_topk=model_params['moe_router_topk'],
+        moe_grouped_gemm=False,
+        moe_layer_freq=1,
+        moe_token_dispatcher_type=moe_dispatcher_type,
+        moe_enable_deepep=use_deepep,
+        moe_router_dtype="fp32",
+        overlap_moe_expert_parallel_comm=overlap_moe_expert_parallel_comm,
+        overlap_p2p_comm=True,
+        batch_p2p_comm=False,
+        sequence_parallel=(tp_size > 1),
+        delay_wgrad_compute=overlap_moe_expert_parallel_comm,
+    )
+    config.num_query_groups = model_params['num_query_groups']
+    config.moe_ffn_hidden_size = model_params['moe_ffn_hidden_size']
+    config.rotary_base = model_params['rotary_base']
+    config.layernorm_epsilon = model_params['layernorm_epsilon']
+    config.normalization = model_params['normalization']
+    config.gated_linear_unit = model_params['gated_linear_unit']
+    config.activation_func = model_params['activation_func']
+    try:
+        from megatron.core.transformer.moe.fused_a2a import set_deepep_num_sms
+        set_deepep_num_sms(0)
+    except ImportError:
+        pass
+    model = _build_profile_gpt_model(
+        config=config,
+        vocab_size=vocab_size,
+        max_sequence_length=seq_length,
+    )
+    _debug_log("model build complete")
+    for chunk in model:
+        chunk.model_type = ModelType.encoder_or_decoder
+
+    data_iterator = [
+        _make_profile_data_iterator(
+            num_microbatches=num_microbatches * total_steps,
+            seq_length=seq_length // cp_size,  # FIX: CP distributes sequence chunks locally
+            micro_batch_size=micro_batch_size,
+            vocab_size=vocab_size,
+        )
+        for _ in range(vpp_size)
+    ]
+    _debug_log("data iterators prepared")
+
+    
+    def forward_step_func(data_iter, model_chunk, return_schedule_plan=False):
+        _debug_log(f"forward_step_func ENTER data_iter_type={type(data_iter).__name__} model={type(model_chunk).__name__}")
+        _debug_log(f"forward_step_func calling next(data_iter)...")
+        batch = next(data_iter)
+        _debug_log(f"forward_step_func next(data_iter) returned OK")
+        _debug_log(
+            f"forward_step_func batch ready return_schedule_plan={return_schedule_plan} "
+            f"input_shape={tuple(batch['input_ids'].shape)}"
+        )
+
+        def loss_func(output_tensor):
+            if isinstance(output_tensor, (list, tuple)):
+                output_tensor = output_tensor[0]
+            loss = output_tensor.float().mean()
+            # NOTE: Do NOT dist.all_reduce here – loss_func is only called on
+            # the last pipeline stage, so a world-wide collective would deadlock
+            # because pp_rank=0 never enters this code path.
+            _debug_log(f"loss_func loss={loss.item():.6f}")
+            return loss, {'loss_reduced': loss.detach().clone()}
+
+        _debug_log(f"build_schedule_plan BEGIN")
+        schedule_plan = model_chunk.build_schedule_plan(**batch)
+        _debug_log(f"build_schedule_plan DONE")
+        num_layers = getattr(schedule_plan, '_transformer_layers', None)
+        if num_layers is not None:
+            num_layers = len(num_layers)
+        _debug_log(
+            f"schedule_plan built chunk={type(model_chunk).__name__} "
+            f"plan_type={type(schedule_plan).__name__} vp_stage={getattr(schedule_plan, 'vp_stage', 'na')} "
+            f"num_layers={num_layers}"
+        )
+        if return_schedule_plan:
+            return schedule_plan, loss_func
+        return model_chunk(**batch), loss_func
+
+    unit_wall_times_ms = []
+    unit_gpu_times_ms = []
+    gpu_events = []
+
+    def _record_profile_unit(label, fn, *args, **kwargs):
+        _debug_log(f"enter {label} ({tag})")
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(torch.cuda.current_stream())
+
+        start_time = time.perf_counter()
+
+        result = fn(*args, **kwargs)
+
+        unit_wall_times_ms.append((time.perf_counter() - start_time) * 1000.0)
+
+        end_event.record(torch.cuda.current_stream())
+        gpu_events.append((start_event, end_event))
+
+        _debug_log(f"exit {label} ({tag})")
+        return result
+
+    if overlap_moe_expert_parallel_comm:
+        original_fn = schedule.combined_1f1b_schedule_for_interleaved_pipelining
+
+        def profiled_combined_fn(*args, **kwargs):
+            return _record_profile_unit(
+                'combined_1f1b_schedule_for_interleaved_pipelining',
+                original_fn,
+                *args,
+                **kwargs,
+            )
+
+        mocker.patch.object(
+            schedule,
+            'combined_1f1b_schedule_for_interleaved_pipelining',
+            side_effect=profiled_combined_fn,
+        )
+
+    forward_backward_func = get_forward_backward_func()
+    assert forward_backward_func == schedule.forward_backward_pipelining_with_interleaving
+    _debug_log(f"forward_backward_func={forward_backward_func.__name__}")
+
+    def run_profiled_forward_backward_step(*, record_unit: bool):
+        call_kwargs = dict(
+            forward_step_func=forward_step_func,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=seq_length,
+            forward_only=False,
+        )
+        if record_unit and not overlap_moe_expert_parallel_comm:
+            return _record_profile_unit(
+                'forward_backward_pipelining_with_interleaving',
+                forward_backward_func,
+                **call_kwargs,
+            )
+        return forward_backward_func(**call_kwargs)
+
+    _debug_log(f"starting {num_warmup_steps} warmup steps ({tag})")
+    for step in range(num_warmup_steps):
+        _ = run_profiled_forward_backward_step(record_unit=not overlap_moe_expert_parallel_comm)
+        
+    torch.cuda.synchronize()
+    unit_wall_times_ms.clear()
+    gpu_events.clear()
+    _debug_log(f"warmup complete, metrics cleared.")
+
+    _debug_log(f"torch profiler start for {num_profile_steps} steps ({tag})")
+    try:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        ) as prof:
+            for step in range(num_profile_steps):
+                losses_reduced = run_profiled_forward_backward_step(
+                    record_unit=not overlap_moe_expert_parallel_comm
+                )
+    except Exception as exc:
+        _debug_log(f"forward_backward_func failed: {type(exc).__name__}: {exc}")
+        _debug_log(traceback.format_exc())
+        raise
+        
+    torch.cuda.synchronize()
+    for start_ev, end_ev in gpu_events:
+        unit_gpu_times_ms.append(start_ev.elapsed_time(end_ev))
+        
+    _debug_log(f"torch profiler done ({tag})")
+
+    trace_env = (
+        'BASELINE_1F1B_TRACE_DIR'
+        if overlap_moe_expert_parallel_comm
+        else 'INTERLEAVED_1F1B_TRACE_DIR'
+    )
+    trace_dir = os.environ.get(trace_env)
+
+    unit_count = len(unit_wall_times_ms)
+    assert unit_count > 0, f"No {tag} units were executed"
+    local_unit_ms = sum(unit_wall_times_ms) / unit_count
+    assert local_unit_ms > 0.0
+
+    current_rank = dist.get_rank()
+    is_last_pp_stage = parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+
+    if is_last_pp_stage:
+        assert len(losses_reduced) > 0
+    else:
+        assert losses_reduced == []
+    valid_total_time_ms = sum(unit_wall_times_ms)
+    total_tokens = seq_length * micro_batch_size * num_microbatches * num_profile_steps
+    throughput_tps = (total_tokens / (valid_total_time_ms / 1000.0)) if valid_total_time_ms > 0 else 0.0
+    _debug_log(
+        f"local_unit_count={unit_count} local_unit_ms={local_unit_ms:.6f}"
+    )
+
+    summary_line = (
+        f"[{tag}_1f1b_profiler] "
+        f"rank={current_rank} world_size={world_size} tp={tp_size} cp={cp_size} ep={ep_size} pp={pp_size} "
+        f"vpp={vpp_size} unit_count={unit_count} \n"
+        f"    => Valid Total Time (Profile Steps Only): {valid_total_time_ms:.2f} ms\n"
+        f"    => Throughput: {throughput_tps:.2f} tokens/sec"
+    )
+    print(summary_line)
+    _debug_log(f"local_unit_ms={local_unit_ms:.6f}")
+    _debug_log(f"losses_reduced_len={len(losses_reduced)}")
+
+    if trace_dir:
+        os.makedirs(trace_dir, exist_ok=True)
+        rank_prefix = os.path.join(trace_dir, f'{tag}_1f1b_rank{current_rank}')
+
+        # 1. Chrome trace JSON
+        prof.export_chrome_trace(f'{rank_prefix}.json')
+        _debug_log(f"chrome trace exported to {rank_prefix}.json")
+
+        # 2. Profiler key averages table (kernel-level CPU/CUDA timing)
+        key_avg_table = prof.key_averages().table(
+            sort_by="cuda_time_total", row_limit=100
+        )
+        with open(f'{rank_prefix}_key_averages.txt', 'w') as f:
+            f.write(key_avg_table)
+        _debug_log(f"key averages exported to {rank_prefix}_key_averages.txt")
+
+        # 3. Summary + per-unit wall times + losses
+        with open(f'{rank_prefix}_summary.txt', 'w') as f:
+            f.write(f"# {tag} 1F1B profiler summary  rank={current_rank}\n\n")
+            f.write(f"## Config\n")
+            f.write(f"world_size={world_size} tp={tp_size} cp={cp_size} ep={ep_size} "
+                    f"pp={pp_size} vpp={vpp_size}\n")
+            f.write(f"seq_length={seq_length} micro_batch_size={micro_batch_size} "
+                    f"hidden_size={hidden_size} num_microbatches={num_microbatches} "
+                    f"vocab_size={vocab_size}\n")
+            f.write(f"model_dir={model_params['model_dir']}\n")
+            f.write(
+                f"num_layers={model_params['num_layers']} num_attention_heads={model_params['num_attention_heads']} "
+                f"num_query_groups={model_params['num_query_groups']} ffn_hidden_size={model_params['ffn_hidden_size']} "
+                f"moe_ffn_hidden_size={model_params['moe_ffn_hidden_size']}\n"
+            )
+            f.write(
+                f"num_moe_experts={model_params['num_moe_experts']} moe_router_topk={model_params['moe_router_topk']} "
+                f"rotary_base={model_params['rotary_base']} layernorm_epsilon={model_params['layernorm_epsilon']}\n"
+            )
+            f.write(
+                f"overlap_moe_expert_parallel_comm={overlap_moe_expert_parallel_comm}\n"
+            )
+            f.write(f"delay_wgrad_compute={config.delay_wgrad_compute}\n\n")
+            f.write(f"## Overall Performance (excluding Unit 0)\n")
+            f.write(f"Valid Total Time = {valid_total_time_ms:.4f} ms\n")
+            f.write(f"Total Tokens = {total_tokens}\n")
+            f.write(f"Throughput = {throughput_tps:.2f} tokens/sec\n\n")
+            f.write(f"## Unit wall times (ms)\n")
+            f.write(f"unit_count={unit_count}\n")
+            f.write(f"local_unit_ms_avg={local_unit_ms:.6f}\n")
+            for i, cpu_t in enumerate(unit_wall_times_ms):
+                gpu_t = unit_gpu_times_ms[i]
+                stall_t = cpu_t - gpu_t
+                f.write(f"  unit[{i}] = CPU Wall: {cpu_t:.4f} ms | GPU Compute: {gpu_t:.4f} ms | Stall: {stall_t:.4f} ms\n")
+            f.write(f"\n## Losses\n")
+            f.write(f"is_last_pp_stage={is_last_pp_stage}\n")
+            f.write(f"losses_reduced_len={len(losses_reduced)}\n")
+            for i, lr in enumerate(losses_reduced):
+                loss_val = lr.get('loss_reduced', None) if isinstance(lr, dict) else lr
+                if hasattr(loss_val, 'item'):
+                    loss_val = loss_val.item()
+                f.write(f"  loss[{i}] = {loss_val}\n")
+        _debug_log(f"summary exported to {rank_prefix}_summary.txt")
+
+    _debug_log("destroy_model_parallel begin")
+    parallel_state.destroy_model_parallel()
+    _debug_log(f"{tag} test done")
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_baseline_1f1b_profiler_with_5d_parallel(mocker):
+    _run_1f1b_profiler_with_5d_parallel(mocker)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_interleaved_1f1b_profiler_without_combined_with_5d_parallel(mocker):
+    _run_1f1b_profiler_with_5d_parallel(
+        mocker,
+        overlap_moe_expert_parallel_comm=False,
+    )
