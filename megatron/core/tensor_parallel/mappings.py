@@ -2,22 +2,19 @@
 
 import torch
 
+from megatron.core.network_engine import (
+    ParallelDomain,
+    all_gather as ne_all_gather,
+    all_gather_into_tensor as ne_all_gather_into_tensor,
+    all_reduce as ne_all_reduce,
+    all_to_all_single as ne_all_to_all_single,
+    reduce_scatter as ne_reduce_scatter,
+    reduce_scatter_tensor as ne_reduce_scatter_tensor,
+)
 from megatron.core.parallel_state import get_global_memory_buffer
-from megatron.core.utils import get_tensor_model_parallel_group_if_none, is_torch_min_version
+from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
 from .utils import split_tensor_along_last_dim
-
-try:
-    if is_torch_min_version("1.13.0"):
-        dist_all_gather_func = torch.distributed.all_gather_into_tensor
-        dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
-    else:
-        dist_all_gather_func = torch.distributed._all_gather_base
-        dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
-except:
-    dist_all_gather_func = torch.distributed._all_gather_base
-    dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
-
 
 def _reduce(input_, group):
     """All-reduce the input tensor across model parallel group."""
@@ -28,7 +25,7 @@ def _reduce(input_, group):
         return input_
 
     # All-reduce.
-    torch.distributed.all_reduce(input_.contiguous(), group=group)
+    ne_all_reduce(input_.contiguous(), group=group, domain=ParallelDomain.TP)
 
     return input_
 
@@ -89,7 +86,12 @@ def _gather_along_last_dim(input_, group):
     dim_size[0] = dim_size[0] * world_size
 
     output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
-    dist_all_gather_func(output, input_.contiguous(), group=group)
+    ne_all_gather_into_tensor(
+        output,
+        input_.contiguous(),
+        group=group,
+        domain=ParallelDomain.TP,
+    )
     tensor_list = output.chunk(world_size, dim=0)
     output = torch.cat(tensor_list, dim=-1).contiguous()
 
@@ -139,7 +141,12 @@ def _gather_along_first_dim(input_, group, output_split_sizes=None, use_global_b
             output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
-        dist_all_gather_func(output, input_.contiguous(), group=group)
+        ne_all_gather_into_tensor(
+            output,
+            input_.contiguous(),
+            group=group,
+            domain=ParallelDomain.TP,
+        )
     else:
         dim_size[0] = sum(output_split_sizes)
         if use_global_buffer:
@@ -147,7 +154,12 @@ def _gather_along_first_dim(input_, group, output_split_sizes=None, use_global_b
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
         output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
-        torch.distributed.all_gather(output_tensor_list, input_, group=group)
+        ne_all_gather(
+            output_tensor_list,
+            input_,
+            group=group,
+            domain=ParallelDomain.TP,
+        )
 
     return output
 
@@ -179,7 +191,12 @@ def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_g
             output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
-        dist_reduce_scatter_func(output, input_.contiguous(), group=group)
+        ne_reduce_scatter_tensor(
+            output,
+            input_.contiguous(),
+            group=group,
+            domain=ParallelDomain.TP,
+        )
     else:
         rank = group.rank()
         input_tensor_list = list(torch.split(input_, input_split_sizes, dim=0))
@@ -190,7 +207,12 @@ def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_g
             )
         else:
             output = torch.empty_like(input_tensor_list[rank])
-        torch.distributed.reduce_scatter(output, input_tensor_list, group=group)
+        ne_reduce_scatter(
+            output,
+            input_tensor_list,
+            group=group,
+            domain=ParallelDomain.TP,
+        )
     return output
 
 
@@ -441,12 +463,13 @@ class _AllToAll(torch.autograd.Function):
                 dtype=input.dtype,
                 device=torch.cuda.current_device(),
             )
-        torch.distributed.all_to_all_single(
+        ne_all_to_all_single(
             output,
             input,
             output_split_sizes=output_split_sizes,
             input_split_sizes=input_split_sizes,
             group=group,
+            domain=ParallelDomain.EP,
         )
         return output
 

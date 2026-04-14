@@ -7,6 +7,16 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.network_engine import (
+    CommBackend,
+    ParallelDomain,
+    batch_isend_irecv as ne_batch_isend_irecv,
+    irecv as ne_irecv,
+    isend as ne_isend,
+    p2p_op as ne_p2p_op,
+    resolve_backend,
+    ring_exchange as ne_ring_exchange,
+)
 from megatron.core.utils import nvtx_decorator
 
 # Types
@@ -25,27 +35,52 @@ def _batched_p2p_ops(
 ):
     ops = []
     if tensor_send_prev is not None:
-        send_prev_op = torch.distributed.P2POp(
-            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank, group
+        send_prev_op = ne_p2p_op(
+            torch.distributed.isend,
+            tensor_send_prev,
+            prev_pipeline_rank,
+            group=group,
+            domain=ParallelDomain.PP,
+            intranode=False,
         )
         ops.append(send_prev_op)
     if tensor_recv_prev is not None:
-        recv_prev_op = torch.distributed.P2POp(
-            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank, group
+        recv_prev_op = ne_p2p_op(
+            torch.distributed.irecv,
+            tensor_recv_prev,
+            prev_pipeline_rank,
+            group=group,
+            domain=ParallelDomain.PP,
+            intranode=False,
         )
         ops.append(recv_prev_op)
     if tensor_send_next is not None:
-        send_next_op = torch.distributed.P2POp(
-            torch.distributed.isend, tensor_send_next, next_pipeline_rank, group
+        send_next_op = ne_p2p_op(
+            torch.distributed.isend,
+            tensor_send_next,
+            next_pipeline_rank,
+            group=group,
+            domain=ParallelDomain.PP,
+            intranode=False,
         )
         ops.append(send_next_op)
     if tensor_recv_next is not None:
-        recv_next_op = torch.distributed.P2POp(
-            torch.distributed.irecv, tensor_recv_next, next_pipeline_rank, group
+        recv_next_op = ne_p2p_op(
+            torch.distributed.irecv,
+            tensor_recv_next,
+            next_pipeline_rank,
+            group=group,
+            domain=ParallelDomain.PP,
+            intranode=False,
         )
         ops.append(recv_next_op)
     if len(ops) > 0:
-        reqs = torch.distributed.batch_isend_irecv(ops)
+        reqs = ne_batch_isend_irecv(
+            ops,
+            domain=ParallelDomain.PP,
+            group=group,
+            intranode=False,
+        )
     else:
         reqs = []
     return reqs
@@ -77,51 +112,83 @@ def _p2p_ops(
 
     if group.rank() % 2 == 0:
         if tensor_send_next is not None:
-            send_next_req = torch.distributed.isend(
-                tensor=tensor_send_next, dst=next_pipeline_rank, group=even_send_odd_recv_group
+            send_next_req = ne_isend(
+                tensor_send_next,
+                dst=next_pipeline_rank,
+                group=even_send_odd_recv_group,
+                domain=ParallelDomain.PP,
+                intranode=False,
             )
             reqs["send_next"] = send_next_req
 
         if tensor_recv_prev is not None:
-            recv_prev_req = torch.distributed.irecv(
-                tensor=tensor_recv_prev, src=prev_pipeline_rank, group=even_recv_odd_send_group
+            recv_prev_req = ne_irecv(
+                tensor_recv_prev,
+                src=prev_pipeline_rank,
+                group=even_recv_odd_send_group,
+                domain=ParallelDomain.PP,
+                intranode=False,
             )
             reqs["recv_prev"] = recv_prev_req
 
         if tensor_send_prev is not None:
-            send_prev_req = torch.distributed.isend(
-                tensor=tensor_send_prev, dst=prev_pipeline_rank, group=even_send_odd_recv_group
+            send_prev_req = ne_isend(
+                tensor_send_prev,
+                dst=prev_pipeline_rank,
+                group=even_send_odd_recv_group,
+                domain=ParallelDomain.PP,
+                intranode=False,
             )
             reqs["send_prev"] = send_prev_req
 
         if tensor_recv_next is not None:
-            recv_next_req = torch.distributed.irecv(
-                tensor=tensor_recv_next, src=next_pipeline_rank, group=even_recv_odd_send_group
+            recv_next_req = ne_irecv(
+                tensor_recv_next,
+                src=next_pipeline_rank,
+                group=even_recv_odd_send_group,
+                domain=ParallelDomain.PP,
+                intranode=False,
             )
             reqs["recv_next"] = recv_next_req
 
     else:
         if tensor_recv_prev is not None:
-            recv_prev_req = torch.distributed.irecv(
-                tensor=tensor_recv_prev, src=prev_pipeline_rank, group=even_send_odd_recv_group
+            recv_prev_req = ne_irecv(
+                tensor_recv_prev,
+                src=prev_pipeline_rank,
+                group=even_send_odd_recv_group,
+                domain=ParallelDomain.PP,
+                intranode=False,
             )
             reqs["recv_prev"] = recv_prev_req
 
         if tensor_send_next is not None:
-            send_next_req = torch.distributed.isend(
-                tensor=tensor_send_next, dst=next_pipeline_rank, group=even_recv_odd_send_group
+            send_next_req = ne_isend(
+                tensor_send_next,
+                dst=next_pipeline_rank,
+                group=even_recv_odd_send_group,
+                domain=ParallelDomain.PP,
+                intranode=False,
             )
             reqs["send_next"] = send_next_req
 
         if tensor_recv_next is not None:
-            recv_next_req = torch.distributed.irecv(
-                tensor=tensor_recv_next, src=next_pipeline_rank, group=even_send_odd_recv_group
+            recv_next_req = ne_irecv(
+                tensor_recv_next,
+                src=next_pipeline_rank,
+                group=even_send_odd_recv_group,
+                domain=ParallelDomain.PP,
+                intranode=False,
             )
             reqs["recv_next"] = recv_next_req
 
         if tensor_send_prev is not None:
-            send_prev_req = torch.distributed.isend(
-                tensor=tensor_send_prev, dst=prev_pipeline_rank, group=even_recv_odd_send_group
+            send_prev_req = ne_isend(
+                tensor_send_prev,
+                dst=prev_pipeline_rank,
+                group=even_recv_odd_send_group,
+                domain=ParallelDomain.PP,
+                intranode=False,
             )
             reqs["send_prev"] = send_prev_req
     return reqs
@@ -161,6 +228,12 @@ class P2PCommunicator:
             if config.virtual_pipeline_model_parallel_size is not None
             else None
         )
+        self.backend_decision = resolve_backend(ParallelDomain.PP, intranode=False)
+        if self.backend_decision.backend != CommBackend.TORCH_DIST:
+            raise RuntimeError(
+                "Pipeline parallel backend routing resolved to unsupported backend "
+                f"{self.backend_decision.backend.value}; only torch_dist is supported now"
+            )
 
     def _communicate_shapes(self, tensor_send_next, tensor_send_prev, recv_prev, recv_next):
         """Communicate tensor shapes between stages. Used to communicate
@@ -203,7 +276,8 @@ class P2PCommunicator:
             )
 
         if config.use_ring_exchange_p2p:
-            torch.distributed.ring_exchange(
+            ne_ring_exchange(
+                domain=ParallelDomain.PP,
                 tensor_send_prev=send_prev_shape_tensor,
                 tensor_recv_prev=recv_prev_shape_tensor,
                 tensor_send_next=send_next_shape_tensor,
@@ -213,27 +287,52 @@ class P2PCommunicator:
         else:
             ops = []
             if send_prev_shape_tensor is not None:
-                send_prev_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank, self.pp_group
+                send_prev_op = ne_p2p_op(
+                    torch.distributed.isend,
+                    send_prev_shape_tensor,
+                    self.prev_rank,
+                    group=self.pp_group,
+                    domain=ParallelDomain.PP,
+                    intranode=False,
                 )
                 ops.append(send_prev_op)
             if recv_prev_shape_tensor is not None:
-                recv_prev_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank, self.pp_group
+                recv_prev_op = ne_p2p_op(
+                    torch.distributed.irecv,
+                    recv_prev_shape_tensor,
+                    self.prev_rank,
+                    group=self.pp_group,
+                    domain=ParallelDomain.PP,
+                    intranode=False,
                 )
                 ops.append(recv_prev_op)
             if send_next_shape_tensor is not None:
-                send_next_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_next_shape_tensor, self.next_rank, self.pp_group
+                send_next_op = ne_p2p_op(
+                    torch.distributed.isend,
+                    send_next_shape_tensor,
+                    self.next_rank,
+                    group=self.pp_group,
+                    domain=ParallelDomain.PP,
+                    intranode=False,
                 )
                 ops.append(send_next_op)
             if recv_next_shape_tensor is not None:
-                recv_next_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank, self.pp_group
+                recv_next_op = ne_p2p_op(
+                    torch.distributed.irecv,
+                    recv_next_shape_tensor,
+                    self.next_rank,
+                    group=self.pp_group,
+                    domain=ParallelDomain.PP,
+                    intranode=False,
                 )
                 ops.append(recv_next_op)
             if len(ops) > 0:
-                reqs = torch.distributed.batch_isend_irecv(ops)
+                reqs = ne_batch_isend_irecv(
+                    ops,
+                    domain=ParallelDomain.PP,
+                    group=self.pp_group,
+                    intranode=False,
+                )
                 for req in reqs:
                     req.wait()
 
