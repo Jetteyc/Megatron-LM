@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 import sys
@@ -61,6 +62,135 @@ def _debug_log(message):
         file=sys.stderr,
         flush=True,
     )
+
+
+def _bytes_to_mib(num_bytes):
+    return num_bytes / (1024.0 * 1024.0)
+
+
+def _schedule_test_repo_root():
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+
+
+def _default_schedule_test_trace_dir():
+    run_id = os.environ.get('RUN_ID', time.strftime('%Y%m%d_%H%M%S'))
+    return os.path.join(_schedule_test_repo_root(), 'outputs', '1f1b_profiler', run_id)
+
+
+def _normalize_schedule_test_trace_dir(trace_dir):
+    if not trace_dir:
+        trace_dir = _default_schedule_test_trace_dir()
+    elif not os.path.isabs(trace_dir):
+        trace_dir = os.path.join(_schedule_test_repo_root(), trace_dir)
+    return os.path.abspath(trace_dir)
+
+
+def _repo_display_path(path):
+    abs_path = os.path.abspath(path)
+    repo_root = _schedule_test_repo_root()
+    repo_name = os.path.basename(repo_root)
+    try:
+        rel_path = os.path.relpath(abs_path, repo_root)
+    except ValueError:
+        return abs_path
+    if rel_path == '.':
+        return repo_name
+    return os.path.join(repo_name, rel_path)
+
+
+def _collect_cuda_memory_stats(phase):
+    stats = torch.cuda.memory_stats()
+    return {
+        'phase': phase,
+        'allocated_bytes': int(torch.cuda.memory_allocated()),
+        'reserved_bytes': int(torch.cuda.memory_reserved()),
+        'max_allocated_bytes': int(torch.cuda.max_memory_allocated()),
+        'max_reserved_bytes': int(torch.cuda.max_memory_reserved()),
+        'active_bytes_current': int(stats.get('active_bytes.all.current', 0)),
+        'active_bytes_peak': int(stats.get('active_bytes.all.peak', 0)),
+        'inactive_split_bytes_current': int(stats.get('inactive_split_bytes.all.current', 0)),
+        'inactive_split_bytes_peak': int(stats.get('inactive_split_bytes.all.peak', 0)),
+        'requested_bytes_current': int(stats.get('requested_bytes.all.current', 0)),
+        'requested_bytes_peak': int(stats.get('requested_bytes.all.peak', 0)),
+        'num_alloc_retries': int(stats.get('num_alloc_retries', 0)),
+        'num_ooms': int(stats.get('num_ooms', 0)),
+    }
+
+
+def _try_enable_cuda_memory_history(trace_alloc_max_entries=200_000, stack_depth=32):
+    recorder = getattr(torch.cuda.memory, '_record_memory_history', None)
+    if recorder is None:
+        _debug_log('torch.cuda.memory._record_memory_history is unavailable')
+        return {'enabled': False, 'reason': 'unavailable'}
+
+    try:
+        params = set(inspect.signature(recorder).parameters.keys())
+    except (TypeError, ValueError) as exc:
+        _debug_log(f'failed to inspect _record_memory_history signature: {exc}')
+        return {'enabled': False, 'reason': f'signature_error: {exc}'}
+
+    kwargs = {}
+    if 'context' in params:
+        kwargs['context'] = 'all'
+    if 'stacks' in params:
+        kwargs['stacks'] = 'all'
+    if 'max_entries' in params:
+        kwargs['max_entries'] = trace_alloc_max_entries
+    elif 'trace_alloc_max_entries' in params:
+        kwargs['trace_alloc_max_entries'] = trace_alloc_max_entries
+    if 'stack_depth' in params:
+        kwargs['stack_depth'] = stack_depth
+    if 'record_context' in params:
+        kwargs['record_context'] = True
+    if 'trace_alloc_record_context' in params:
+        kwargs['trace_alloc_record_context'] = True
+
+    try:
+        recorder(**kwargs)
+        mode = 'native'
+        used_kwargs = kwargs
+    except TypeError:
+        legacy_kwargs = {}
+        if 'enabled' in params:
+            legacy_kwargs['enabled'] = True
+        if 'trace_alloc_max_entries' in params:
+            legacy_kwargs['trace_alloc_max_entries'] = trace_alloc_max_entries
+        if 'trace_alloc_record_context' in params:
+            legacy_kwargs['trace_alloc_record_context'] = True
+        elif 'record_context' in params:
+            legacy_kwargs['record_context'] = True
+
+        try:
+            recorder(**legacy_kwargs)
+            mode = 'legacy'
+            used_kwargs = legacy_kwargs
+        except Exception as exc:
+            _debug_log(f'failed to enable CUDA memory history: {type(exc).__name__}: {exc}')
+            return {'enabled': False, 'reason': repr(exc)}
+    except Exception as exc:
+        _debug_log(f'failed to enable CUDA memory history: {type(exc).__name__}: {exc}')
+        return {'enabled': False, 'reason': repr(exc)}
+
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
+    _debug_log(f'CUDA memory history enabled mode={mode} args={used_kwargs}')
+    return {'enabled': True, 'mode': mode, 'args': used_kwargs}
+
+
+def _try_dump_cuda_memory_snapshot(snapshot_path):
+    dumper = getattr(torch.cuda.memory, '_dump_snapshot', None)
+    if dumper is None:
+        _debug_log('torch.cuda.memory._dump_snapshot is unavailable')
+        return False, 'unavailable'
+
+    try:
+        torch.cuda.synchronize()
+        dumper(snapshot_path)
+        _debug_log(f'CUDA memory snapshot exported to {snapshot_path}')
+        return True, None
+    except Exception as exc:
+        _debug_log(f'failed to dump CUDA memory snapshot: {type(exc).__name__}: {exc}')
+        return False, repr(exc)
 
 
 class _ScheduleTestGPTModel(GPTModel):
@@ -992,6 +1122,12 @@ def _run_1f1b_profiler_with_5d_parallel(
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
     tag = "baseline" if overlap_moe_expert_parallel_comm else "interleaved"
+    trace_env = (
+        'BASELINE_1F1B_TRACE_DIR'
+        if overlap_moe_expert_parallel_comm
+        else 'INTERLEAVED_1F1B_TRACE_DIR'
+    )
+    trace_dir = _normalize_schedule_test_trace_dir(os.environ.get(trace_env))
 
     tp_size = 2
     cp_size = 2
@@ -1040,6 +1176,9 @@ def _run_1f1b_profiler_with_5d_parallel(
     _debug_log(
         f"set_streams done comp_stream={torch.cuda.current_stream()} comm_stream={get_comm_stream()}"
     )
+
+    memory_history_info = _try_enable_cuda_memory_history()
+    memory_phase_stats = [_collect_cuda_memory_stats('post_stream_setup')]
 
     use_deepep = _should_enable_deepep(ep_size)
     moe_dispatcher_type = "flex" if use_deepep else "alltoall"
@@ -1098,6 +1237,7 @@ def _run_1f1b_profiler_with_5d_parallel(
         max_sequence_length=seq_length,
     )
     _debug_log("model build complete")
+    memory_phase_stats.append(_collect_cuda_memory_stats('post_model_build'))
     for chunk in model:
         chunk.model_type = ModelType.encoder_or_decoder
 
@@ -1216,6 +1356,9 @@ def _run_1f1b_profiler_with_5d_parallel(
         _ = run_profiled_forward_backward_step(record_unit=not overlap_moe_expert_parallel_comm)
         
     torch.cuda.synchronize()
+    memory_phase_stats.append(_collect_cuda_memory_stats('post_warmup'))
+    torch.cuda.reset_peak_memory_stats()
+    memory_phase_stats.append(_collect_cuda_memory_stats('post_warmup_peak_reset'))
     unit_wall_times_ms.clear()
     gpu_events.clear()
     _debug_log(f"warmup complete, metrics cleared.")
@@ -1235,17 +1378,11 @@ def _run_1f1b_profiler_with_5d_parallel(
         raise
         
     torch.cuda.synchronize()
+    memory_phase_stats.append(_collect_cuda_memory_stats('post_profile'))
     for start_ev, end_ev in gpu_events:
         unit_gpu_times_ms.append(start_ev.elapsed_time(end_ev))
         
     _debug_log(f"torch profiler done ({tag})")
-
-    trace_env = (
-        'BASELINE_1F1B_TRACE_DIR'
-        if overlap_moe_expert_parallel_comm
-        else 'INTERLEAVED_1F1B_TRACE_DIR'
-    )
-    trace_dir = os.environ.get(trace_env)
 
     unit_count = len(unit_wall_times_ms)
     assert unit_count > 0, f"No {tag} units were executed"
@@ -1280,10 +1417,46 @@ def _run_1f1b_profiler_with_5d_parallel(
     if trace_dir:
         os.makedirs(trace_dir, exist_ok=True)
         rank_prefix = os.path.join(trace_dir, f'{tag}_1f1b_rank{current_rank}')
+        chrome_trace_path = f'{rank_prefix}.json'
+        chrome_trace_display_path = _repo_display_path(chrome_trace_path)
+        memory_phase_stats.append(_collect_cuda_memory_stats('pre_export'))
+        memory_snapshot_path = f'{rank_prefix}_memory_snapshot.pickle'
+        memory_snapshot_display_path = _repo_display_path(memory_snapshot_path)
+        memory_snapshot_dumped, memory_snapshot_error = _try_dump_cuda_memory_snapshot(
+            memory_snapshot_path
+        )
+        memory_stats_path = f'{rank_prefix}_memory_stats.json'
+        memory_summary_path = f'{rank_prefix}_memory_summary.txt'
+        memory_stats_display_path = _repo_display_path(memory_stats_path)
+        memory_summary_display_path = _repo_display_path(memory_summary_path)
+
+        with open(memory_stats_path, 'w') as f:
+            json.dump(
+                {
+                    'rank': current_rank,
+                    'tag': tag,
+                    'trace_dir': _repo_display_path(trace_dir),
+                    'chrome_trace_path': chrome_trace_display_path,
+                    'memory_history': memory_history_info,
+                    'snapshot_dumped': memory_snapshot_dumped,
+                    'snapshot_path': memory_snapshot_display_path if memory_snapshot_dumped else None,
+                    'snapshot_error': memory_snapshot_error,
+                    'memory_stats_path': memory_stats_display_path,
+                    'memory_summary_path': memory_summary_display_path,
+                    'phases': memory_phase_stats,
+                },
+                f,
+                indent=2,
+            )
+        _debug_log(f"memory stats exported to {memory_stats_path}")
+
+        with open(memory_summary_path, 'w') as f:
+            f.write(torch.cuda.memory_summary())
+        _debug_log(f"memory summary exported to {memory_summary_path}")
 
         # 1. Chrome trace JSON
-        prof.export_chrome_trace(f'{rank_prefix}.json')
-        _debug_log(f"chrome trace exported to {rank_prefix}.json")
+        prof.export_chrome_trace(chrome_trace_path)
+        _debug_log(f"chrome trace exported to {chrome_trace_path}")
 
         # 2. Profiler key averages table (kernel-level CPU/CUDA timing)
         key_avg_table = prof.key_averages().table(
@@ -1320,6 +1493,34 @@ def _run_1f1b_profiler_with_5d_parallel(
             f.write(f"Valid Total Time = {valid_total_time_ms:.4f} ms\n")
             f.write(f"Total Tokens = {total_tokens}\n")
             f.write(f"Throughput = {throughput_tps:.2f} tokens/sec\n\n")
+            f.write(f"## CUDA memory recording\n")
+            f.write(f"trace_dir={_repo_display_path(trace_dir)}\n")
+            f.write(f"chrome_trace_path={chrome_trace_display_path}\n")
+            f.write(f"memory_history_enabled={memory_history_info.get('enabled', False)}\n")
+            f.write(f"memory_history_mode={memory_history_info.get('mode', 'na')}\n")
+            f.write(f"memory_stats_path={memory_stats_display_path}\n")
+            f.write(f"memory_summary_path={memory_summary_display_path}\n")
+            f.write(f"memory_snapshot_dumped={memory_snapshot_dumped}\n")
+            if memory_snapshot_dumped:
+                f.write(f"memory_snapshot_path={memory_snapshot_display_path}\n")
+            if memory_snapshot_error:
+                f.write(f"memory_snapshot_error={memory_snapshot_error}\n")
+            f.write(f"\n## CUDA memory phases\n")
+            for phase_stats in memory_phase_stats:
+                f.write(
+                    "  "
+                    f"{phase_stats['phase']}: "
+                    f"allocated={_bytes_to_mib(phase_stats['allocated_bytes']):.2f} MiB, "
+                    f"reserved={_bytes_to_mib(phase_stats['reserved_bytes']):.2f} MiB, "
+                    f"max_allocated={_bytes_to_mib(phase_stats['max_allocated_bytes']):.2f} MiB, "
+                    f"max_reserved={_bytes_to_mib(phase_stats['max_reserved_bytes']):.2f} MiB, "
+                    f"active_current={_bytes_to_mib(phase_stats['active_bytes_current']):.2f} MiB, "
+                    f"inactive_split_current={_bytes_to_mib(phase_stats['inactive_split_bytes_current']):.2f} MiB, "
+                    f"requested_current={_bytes_to_mib(phase_stats['requested_bytes_current']):.2f} MiB, "
+                    f"num_alloc_retries={phase_stats['num_alloc_retries']}, "
+                    f"num_ooms={phase_stats['num_ooms']}\n"
+                )
+            f.write("\n")
             f.write(f"## Unit wall times (ms)\n")
             f.write(f"unit_count={unit_count}\n")
             f.write(f"local_unit_ms_avg={local_unit_ms:.6f}\n")
