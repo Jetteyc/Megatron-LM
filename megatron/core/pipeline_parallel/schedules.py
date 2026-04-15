@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import logging
+import os
 from functools import partial
 from typing import Callable, Iterator, List, Optional, Union
 
@@ -33,6 +35,7 @@ from megatron.core.utils import (
 )
 
 from .combined_1f1b import (
+    _DEFERRED_GRAD,
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
@@ -40,6 +43,22 @@ from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
+logger = logging.getLogger(__name__)
+
+
+def _staggered_debug_enabled() -> bool:
+    return os.getenv("NE_STAGGERED_1F1B_LOG", "0") == "1"
+
+
+def _dist_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return -1
+
+
+def _slog(msg: str, *args):
+    if _staggered_debug_enabled():
+        logger.info("[Staggered1F1B][rank=%s] " + msg, _dist_rank(), *args)
 
 
 def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
@@ -1266,7 +1285,30 @@ def forward_backward_pipelining_with_interleaving(
                 output_tensor_grads[model_chunk_id].append(None)
         input_tensor = input_tensors[model_chunk_id].pop(0)
         output_tensor = output_tensors[model_chunk_id].pop(0)
-        output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
+        deferred_enabled = False
+        if os.getenv("STAGGERED_1F1B", "0") == "1":
+            from megatron.core.models.common.model_chunk_schedule_plan import (
+                StaggeredTransformerModelChunkSchedulePlan,
+            )
+
+            deferred_enabled = StaggeredTransformerModelChunkSchedulePlan.is_backward_deferred()
+
+        if deferred_enabled and len(output_tensor_grads[model_chunk_id]) == 0:
+            output_tensor_grad = _DEFERRED_GRAD
+            _slog(
+                "backward_preprocess deferred grad marker set vmb=%s chunk=%s",
+                virtual_microbatch_id,
+                model_chunk_id,
+            )
+        else:
+            output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
+            if os.getenv("STAGGERED_1F1B", "0") == "1":
+                _slog(
+                    "backward_preprocess pop grad vmb=%s chunk=%s remaining=%s",
+                    virtual_microbatch_id,
+                    model_chunk_id,
+                    len(output_tensor_grads[model_chunk_id]),
+                )
 
         return input_tensor, output_tensor, output_tensor_grad
 
@@ -1562,6 +1604,19 @@ def forward_backward_pipelining_with_interleaving(
 
     # Run 1F1B in steady state.
     nvtx_range_push(suffix="steady")
+    if (
+        config.overlap_moe_expert_parallel_comm
+        and not forward_only
+        and os.getenv("STAGGERED_1F1B", "0") == "1"
+    ):
+        from megatron.core.models.common.model_chunk_schedule_plan import (
+            StaggeredTransformerModelChunkSchedulePlan,
+        )
+
+        StaggeredTransformerModelChunkSchedulePlan._deferred_grad_getter = (
+            lambda mc_id: output_tensor_grads[mc_id].pop(0)
+        )
+        _slog("steady start set deferred_grad_getter")
     for k in range(num_microbatches_remaining):
         # Forward pass.
         forward_k = k + num_warmup_microbatches
@@ -1670,8 +1725,8 @@ def forward_backward_pipelining_with_interleaving(
                             recv_next_wait_handle = recv_next_wait_handles.pop(0)
                             recv_next_wait_handle.wait()
 
-            # Async backward send / receive
-            def pp_post_backward(input_tensor_grad, vp_stage=None):
+            # Async backward send / receive (baseline path)
+            def pp_post_backward_baseline(input_tensor_grad, vp_stage=None):
                 nonlocal send_prev_wait_handle
                 nonlocal bwd_wait_handles
                 nonlocal recv_next_wait_handles
@@ -1684,6 +1739,8 @@ def forward_backward_pipelining_with_interleaving(
                 recv_next, next_backward_model_chunk_id = recv_tensor_from_previous_stage(
                     backward_k, forward=False
                 )
+                if os.getenv("STAGGERED_1F1B", "0") == "1":
+                    _slog("pp_post_backward_baseline bk=%s vp_stage=%s recv_next=%s", backward_k, vp_stage, recv_next)
 
                 (bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles) = (
                     p2p_communicator.send_backward_recv_backward(
@@ -1713,6 +1770,59 @@ def forward_backward_pipelining_with_interleaving(
                     )
                     bwd_recv_buffer[(backward_k + 1) % bwd_recv_buffer_size] = None
                 return input_tensor_grad
+
+            # Async backward send / receive (staggered path):
+            # capture backward_k by value for deferred invocation on next iteration.
+            def pp_post_backward_staggered(input_tensor_grad, vp_stage=None, _captured_bk=backward_k):
+                nonlocal send_prev_wait_handle
+                nonlocal bwd_wait_handles
+                nonlocal recv_next_wait_handles
+                bk = _captured_bk
+                if vp_stage is None:
+                    vp_stage = get_model_chunk_id(bk, forward=False)
+                # First virtual stage no activation gradient tensor to send.
+                if _is_vp_first_stage(vp_stage=vp_stage) and is_pp_first_stage(pp_group):
+                    input_tensor_grad = None
+
+                recv_next, next_backward_model_chunk_id = recv_tensor_from_previous_stage(
+                    bk, forward=False
+                )
+                _slog("pp_post_backward_staggered bk=%s vp_stage=%s recv_next=%s", bk, vp_stage, recv_next)
+
+                (bwd_recv_buffer[bk % bwd_recv_buffer_size], bwd_wait_handles) = (
+                    p2p_communicator.send_backward_recv_backward(
+                        input_tensor_grad,
+                        recv_next=recv_next,
+                        tensor_shape=tensor_shape,
+                        overlap_p2p_comm=True,
+                    )
+                )
+                if send_prev_wait_handle is not None:
+                    send_prev_wait_handle.wait()
+                if bwd_wait_handles is not None:
+                    send_prev_wait_handle = (
+                        bwd_wait_handles.pop("send_prev")
+                        if "send_prev" in bwd_wait_handles
+                        else None
+                    )
+                    if "recv_next" in bwd_wait_handles:
+                        recv_next_wait_handles.append(bwd_wait_handles.pop("recv_next"))
+
+                # Put input_tensor and output_tensor_grad in data structures in the
+                # right location.
+                if recv_next:
+                    output_tensor_grads[next_backward_model_chunk_id].append(
+                        bwd_recv_buffer[bk % bwd_recv_buffer_size]
+                    )
+                    bwd_recv_buffer[(bk + 1) % bwd_recv_buffer_size] = None
+                return input_tensor_grad
+
+            use_staggered_post_backward = os.getenv("STAGGERED_1F1B", "0") == "1"
+            pp_post_backward = (
+                pp_post_backward_staggered
+                if use_staggered_post_backward
+                else pp_post_backward_baseline
+            )
 
             output_tensor, input_tensor_grad = forward_backward_helper_wrapper(
                 f_virtual_microbatch_id=forward_k,
@@ -1776,6 +1886,17 @@ def forward_backward_pipelining_with_interleaving(
                 output_tensor_grads[next_backward_model_chunk_id].append(output_tensor_grad)
 
     deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+    if config.overlap_moe_expert_parallel_comm and not forward_only and num_microbatches_remaining > 0:
+        from megatron.core.models.common.model_chunk_schedule_plan import (
+            StaggeredTransformerModelChunkSchedulePlan,
+        )
+
+        if (
+            os.getenv("STAGGERED_1F1B", "0") == "1"
+            and StaggeredTransformerModelChunkSchedulePlan._pending_bwd_state is not None
+        ):
+            _slog("steady end flush_pending_backward")
+            StaggeredTransformerModelChunkSchedulePlan.flush_pending_backward()
     nvtx_range_pop(suffix="steady")
 
     # Run cooldown backward passes (flush out pipeline) for the last model chunk.

@@ -20,8 +20,11 @@ MASTER_ADDR=${MASTER_ADDR:-10.156.154.35}
 MASTER_PORT=${MASTER_PORT:-29500}
 
 TEST_TARGET=tests/unit_tests/pipeline_parallel/test_schedules.py
-TEST_FILTER=test_interleaved_1f1b_profiler_without_combined_with_5d_parallel
-# TEST_FILTER=${TEST_FILTER:-test_baseline_1f1b_profiler_with_5d_parallel}
+# TEST_FILTER=test_interleaved_1f1b_profiler_without_combined_with_5d_parallel
+# TEST_FILTER=test_staggered_1f1b_profiler_with_5d_parallel
+TEST_FILTER=${TEST_FILTER:-test_baseline_1f1b_profiler_with_5d_parallel}
+# export NE_STAGGERED_1F1B_LOG=0
+
 PYTEST_ARGS=${PYTEST_ARGS:---tb=long -rA --full-trace}
 SCHEDULE_TEST_DEBUG=${SCHEDULE_TEST_DEBUG:-0}
 
@@ -45,7 +48,8 @@ export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER:-1}
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export TORCH_SHOW_CPP_STACKTRACES=${TORCH_SHOW_CPP_STACKTRACES:-1}
-export TORCH_DISTRIBUTED_DEBUG=${TORCH_DISTRIBUTED_DEBUG:-DETAIL}
+export TORCH_DISABLE_ADDR2LINE=${TORCH_DISABLE_ADDR2LINE:-1}
+export TORCH_DISTRIBUTED_DEBUG=${TORCH_DISTRIBUTED_DEBUG:-INFO}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export SCHEDULE_TEST_DEBUG
 
@@ -54,11 +58,8 @@ NPROC_PER_NODE=${NPROC_PER_NODE:-${DEFAULT_NPROC_PER_NODE}}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d_%H%M%S)}
 TRACE_ROOT=${TRACE_ROOT:-${REPO_ROOT}/outputs/1f1b_profiler}
 TRACE_DIR=${TRACE_DIR:-${TRACE_ROOT}/${RUN_ID}}
-export BASELINE_1F1B_TRACE_DIR=${BASELINE_1F1B_TRACE_DIR:-${TRACE_DIR}}
-export INTERLEAVED_1F1B_TRACE_DIR=${INTERLEAVED_1F1B_TRACE_DIR:-${TRACE_DIR}}
 
-mkdir -p "${BASELINE_1F1B_TRACE_DIR}"
-mkdir -p "${INTERLEAVED_1F1B_TRACE_DIR}"
+mkdir -p "${TRACE_DIR}"
 
 cd "${REPO_ROOT}"
 

@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from contextlib import contextmanager, nullcontext
+import logging
 import os
 from typing import Optional
 
@@ -16,9 +17,36 @@ from megatron.core.pipeline_parallel.utils import (
     get_comp_stream,
 )
 
+logger = logging.getLogger(__name__)
+
+
+def _resolve_pp_stream():
+    """Best-effort PP stream resolver.
+
+    Older staggered implementations routed PP send hooks through a PP-specific
+    communication stream. The current codebase does not expose that API, so we
+    keep a local shim and fall back to the default communication stream.
+    """
+    return get_comm_stream()
+
 
 def _record_function_is_enabled() -> bool:
     return os.getenv("NE_RECORD_FUNCTION_DISABLE", "0") != "1"
+
+
+def _staggered_debug_enabled() -> bool:
+    return os.getenv("NE_STAGGERED_1F1B_LOG", "0") == "1"
+
+
+def _dist_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return -1
+
+
+def _slog(msg: str, *args):
+    if _staggered_debug_enabled():
+        logger.info("[Staggered1F1B][rank=%s] " + msg, _dist_rank(), *args)
 
 
 @contextmanager
@@ -540,7 +568,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         if f_schedule_plan is not None and post_forward is not None:
             # post_forward()/send_forward_recv_forward() is running in the communication stream,
             # so the p2p comm could be overlapped with the attn backward
-            with torch.cuda.stream(get_comm_stream()):
+            with torch.cuda.stream(_resolve_pp_stream()):
                 f_schedule_plan.wait_current_stream()
                 with _torch_profiler_range("PP_SEND(F)"):
                     post_forward(f_input, f_schedule_plan.vp_stage)
@@ -576,4 +604,308 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             # Release reference as early as possible, this helps avoid memory leak.
             b_schedule_plan.release_state()
 
+        return f_input
+
+
+class StaggeredTransformerLayerSchedulePlan(TransformerLayerSchedulePlan):
+    @staticmethod
+    def run_staggered_part_1(
+        f_layer,
+        b_layer,
+        f_input=None,
+        b_grad=None,
+        is_last_layer_in_bwd=False,
+    ):
+        _slog(
+            "P1 enter f_layer=%s b_layer=%s is_last_layer_in_bwd=%s",
+            f_layer is not None,
+            b_layer is not None,
+            is_last_layer_in_bwd,
+        )
+        if f_layer is not None:
+            with f_layer.get_fp8_context():
+                with _torch_profiler_range("ATTN(F)"):
+                    f_input = f_layer.attn.forward(f_input)
+
+        if b_layer is not None:
+            with _torch_profiler_range("ATTN(B)"):
+                b_grad = b_layer.attn.backward(b_grad)
+
+        if not is_last_layer_in_bwd:
+            if f_layer is not None:
+                with f_layer.get_fp8_context():
+                    with _torch_profiler_range("DISPATCH(F)"):
+                        f_input = f_layer.moe_dispatch.forward(f_input)
+            if b_layer is not None:
+                with _torch_profiler_range("ATTN(W)"):
+                    b_layer.attn.backward_dw()
+
+        _slog("P1 exit")
+        return f_input, b_grad
+
+    @staticmethod
+    def run_staggered_part_2(
+        f_layer,
+        b_layer,
+        f_input=None,
+        b_grad=None,
+        is_last_layer_in_fwd=False,
+    ):
+        _slog(
+            "P2 enter f_layer=%s b_layer=%s is_last_layer_in_fwd=%s",
+            f_layer is not None,
+            b_layer is not None,
+            is_last_layer_in_fwd,
+        )
+        if b_layer is not None:
+            with _torch_profiler_range("MTP_POST_PROCESS(B)"):
+                b_grad = b_layer.mtp_post_process.backward(b_grad)
+            with _torch_profiler_range("COMBINE(B)"):
+                b_grad = b_layer.moe_combine.backward(b_grad)
+
+        if f_layer is not None:
+            with f_layer.get_fp8_context():
+                with _torch_profiler_range("MLP(F)"):
+                    f_input = f_layer.mlp.forward(f_input)
+
+        if f_layer is not None:
+            with f_layer.get_fp8_context():
+                with _torch_profiler_range("COMBINE(F)"):
+                    f_input = f_layer.moe_combine.forward(f_input)
+                with _torch_profiler_range("MTP_POST_PROCESS(F)"):
+                    f_input = f_layer.mtp_post_process.forward(f_input)
+
+        if b_layer is not None:
+            with _torch_profiler_range("MLP(B)"):
+                b_grad = b_layer.mlp.backward(b_grad)
+
+        if b_layer is not None and not is_last_layer_in_fwd:
+            with _torch_profiler_range("DISPATCH(B)"):
+                b_grad = b_layer.moe_dispatch.backward(b_grad)
+            with _torch_profiler_range("MLP(W)"):
+                b_layer.mlp.backward_dw()
+
+        _slog("P2 exit")
+        return f_input, b_grad
+
+
+class StaggeredTransformerModelChunkSchedulePlan(TransformerModelChunkSchedulePlan):
+    _pending_bwd_state = None
+    _deferred_grad_getter = None
+
+    @classmethod
+    def is_backward_deferred(cls):
+        return True
+
+    @staticmethod
+    def flush_pending_backward():
+        if StaggeredTransformerModelChunkSchedulePlan._pending_bwd_state is None:
+            _slog("flush skip (no pending state)")
+            return
+        _slog("flush start")
+        StaggeredTransformerModelChunkSchedulePlan.run_first_layer_part1(
+            f_schedule_plan=None,
+            pre_forward=None,
+        )
+        _slog("flush done")
+
+    @staticmethod
+    def run(
+        f_schedule_plan,
+        b_schedule_plan,
+        b_grad=None,
+        pre_forward=None,
+        pre_backward=None,
+        post_forward=None,
+        post_backward=None,
+    ):
+        _slog(
+            "run enter f_plan=%s b_plan=%s b_grad_none=%s",
+            f_schedule_plan is not None,
+            b_schedule_plan is not None,
+            b_grad is None,
+        )
+        if f_schedule_plan is None or b_schedule_plan is None:
+            return TransformerModelChunkSchedulePlan.run(
+                f_schedule_plan,
+                b_schedule_plan,
+                b_grad=b_grad,
+                pre_forward=pre_forward,
+                pre_backward=pre_backward,
+                post_forward=post_forward,
+                post_backward=post_backward,
+            )
+
+        f_input = StaggeredTransformerModelChunkSchedulePlan.run_first_layer_part1(
+            f_schedule_plan=f_schedule_plan,
+            pre_forward=pre_forward,
+        )
+
+        if b_grad is None and b_schedule_plan is not None:
+            getter = getattr(StaggeredTransformerModelChunkSchedulePlan, "_deferred_grad_getter", None)
+            if getter is not None:
+                b_grad = getter(b_schedule_plan.vp_stage)
+                _slog("run deferred getter consumed vp_stage=%s", b_schedule_plan.vp_stage)
+
+        out = StaggeredTransformerModelChunkSchedulePlan.run_other_layers(
+            f_schedule_plan=f_schedule_plan,
+            b_schedule_plan=b_schedule_plan,
+            b_grad=b_grad,
+            pre_backward=pre_backward,
+            post_forward=post_forward,
+            post_backward=post_backward,
+            f_input=f_input,
+        )
+        _slog("run exit")
+        return out
+
+    @staticmethod
+    def run_first_layer_part1(
+        f_schedule_plan,
+        *,
+        pre_forward=None,
+    ):
+        _slog("run_first_layer_part1 enter f_plan=%s", f_schedule_plan is not None)
+        f_input = None
+        if f_schedule_plan is not None:
+            if pre_forward is not None:
+                with _torch_profiler_range("PP_PRE(F)"):
+                    pre_forward(f_schedule_plan.vp_stage)
+            f_schedule_plan.record_current_stream()
+            with _torch_profiler_range("PRE_PROCESS(F)"):
+                f_input = f_schedule_plan.pre_process.forward()
+
+        f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
+        pending_state = StaggeredTransformerModelChunkSchedulePlan._pending_bwd_state
+        prev_b_plan = pending_state["plan"] if pending_state is not None else None
+        prev_b_grad = pending_state["grad"] if pending_state is not None else None
+        prev_num_layers = prev_b_plan.num_layers() if prev_b_plan is not None else 0
+
+        f_layer_0 = f_schedule_plan.get_layer(0) if f_num_layers > 0 else None
+        prev_b_layer_0 = prev_b_plan.get_layer(0) if prev_num_layers > 0 else None
+        is_first_steady = prev_b_layer_0 is None
+        _slog(
+            "run_first_layer_part1 pending prev_plan=%s is_first_steady=%s",
+            prev_b_plan is not None,
+            is_first_steady,
+        )
+
+        if f_layer_0 is not None or prev_b_layer_0 is not None:
+            with _torch_profiler_range("Staggered_F0_B0_P1"):
+                f_input, prev_b_grad = StaggeredTransformerLayerSchedulePlan.run_staggered_part_1(
+                    f_layer_0,
+                    prev_b_layer_0,
+                    f_input=f_input,
+                    b_grad=prev_b_grad,
+                    is_last_layer_in_bwd=(prev_b_layer_0 is not None),
+                )
+
+        stored_post_backward = pending_state.get("post_backward") if pending_state is not None else None
+        if prev_b_plan is not None and stored_post_backward is not None:
+            _slog("run_first_layer_part1 send deferred backward vp_stage=%s", prev_b_plan.vp_stage)
+            with torch.cuda.stream(_resolve_pp_stream()):
+                prev_b_plan.wait_current_stream()
+                with _torch_profiler_range("PP_SEND(B)"):
+                    stored_post_backward(prev_b_grad, prev_b_plan.vp_stage)
+
+        if f_layer_0 is not None and not is_first_steady:
+            with _torch_profiler_range("DISPATCH(F)"):
+                f_input = f_layer_0.moe_dispatch.forward(f_input)
+
+        if prev_b_layer_0 is not None and not is_first_steady:
+            with _torch_profiler_range("ATTN(W)"):
+                prev_b_layer_0.attn.backward_dw()
+
+        if prev_b_plan is not None:
+            with _torch_profiler_range("PRE_PROCESS(B)"):
+                prev_b_plan.pre_process.backward(prev_b_grad)
+            prev_b_plan.wait_current_stream()
+            prev_b_plan.release_state()
+            _slog("run_first_layer_part1 released prev_b_plan")
+
+        StaggeredTransformerModelChunkSchedulePlan._pending_bwd_state = None
+        _slog("run_first_layer_part1 exit")
+        return f_input
+
+    @staticmethod
+    def run_other_layers(
+        f_schedule_plan,
+        b_schedule_plan,
+        *,
+        f_input,
+        b_grad=None,
+        pre_backward=None,
+        post_forward=None,
+        post_backward=None,
+    ):
+        _slog(
+            "run_other_layers enter f_layers=%s b_layers=%s",
+            f_schedule_plan.num_layers() if f_schedule_plan is not None else 0,
+            b_schedule_plan.num_layers() if b_schedule_plan is not None else 0,
+        )
+        if b_schedule_plan is not None:
+            b_schedule_plan.record_current_stream()
+            assert b_grad is not None
+            if pre_backward is not None:
+                with _torch_profiler_range("PP_PRE(B)"):
+                    pre_backward(b_schedule_plan.vp_stage)
+                b_schedule_plan.record_current_stream()
+
+            if b_schedule_plan.post_process is not None:
+                with _torch_profiler_range("POST_PROCESS(B)"):
+                    b_grad = b_schedule_plan.post_process.backward(b_grad)
+
+        f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
+        b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
+        assert f_num_layers == b_num_layers
+
+        for i in range(f_num_layers):
+            f_layer = f_schedule_plan.get_layer(i)
+            b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
+            with _torch_profiler_range(f"Staggered_F{i}_B{b_num_layers - 1 - i}_P2"):
+                f_input, b_grad = StaggeredTransformerLayerSchedulePlan.run_staggered_part_2(
+                    f_layer,
+                    b_layer,
+                    f_input=f_input,
+                    b_grad=b_grad,
+                    is_last_layer_in_fwd=(i == f_num_layers - 1),
+                )
+            if i != f_num_layers - 1:
+                next_f_layer = f_schedule_plan.get_layer(i + 1)
+                with _torch_profiler_range(f"Staggered_F{i + 1}_B{b_num_layers - 1 - i}_P1"):
+                    f_input, b_grad = StaggeredTransformerLayerSchedulePlan.run_staggered_part_1(
+                        next_f_layer,
+                        b_layer,
+                        f_input=f_input,
+                        b_grad=b_grad,
+                        is_last_layer_in_bwd=False,
+                    )
+            _slog("run_other_layers iter=%s/%s done", i + 1, f_num_layers)
+
+        if f_schedule_plan is not None and post_forward is not None:
+            with torch.cuda.stream(_resolve_pp_stream()):
+                f_schedule_plan.wait_current_stream()
+                with _torch_profiler_range("PP_SEND(F)"):
+                    post_forward(f_input, f_schedule_plan.vp_stage)
+
+        if b_schedule_plan is not None:
+            with _torch_profiler_range("DISPATCH(B)"):
+                b_grad = b_schedule_plan.get_layer(0).moe_dispatch.backward(b_grad)
+            with _torch_profiler_range("MLP(W)"):
+                b_schedule_plan.get_layer(0).mlp.backward_dw()
+            StaggeredTransformerModelChunkSchedulePlan._pending_bwd_state = {
+                "plan": b_schedule_plan,
+                "grad": b_grad,
+                "post_backward": post_backward,
+            }
+            _slog("run_other_layers set pending_bwd_state vp_stage=%s", b_schedule_plan.vp_stage)
+
+        if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
+            with _torch_profiler_range("POST_PROCESS(F)"):
+                f_input = f_schedule_plan.post_process.forward(f_input)
+
+        if f_schedule_plan is not None:
+            f_schedule_plan.wait_current_stream()
+
+        _slog("run_other_layers exit")
         return f_input

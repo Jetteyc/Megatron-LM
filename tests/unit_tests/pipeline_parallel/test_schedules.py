@@ -37,18 +37,12 @@ from tests.unit_tests.test_utilities import Utils
 rank = Utils.rank
 
 
-_DEFAULT_QWEN_MODEL_DIR = '/data/common/models/Qwen/Qwen3-30B-A3B-Base_8layers'
+_DEFAULT_QWEN_MODEL_DIR = '/data/common/models/Qwen/Qwen3-30B-A3B-Base'
 
 _SCHEDULE_TEST_MODEL_PARAM_OVERRIDES = {
-    'seq_length': 2048,
-    'micro_batch_size': 1,
-    'hidden_size': 768,
-    'num_attention_heads': 12,
-    'ffn_hidden_size': 2048,
-    'moe_ffn_hidden_size': 384,
+    'seq_length': 4096,
+    'num_hidden_layers': 16,
     'num_microbatches': 16,
-    'vocab_size': 8192,
-    'num_moe_experts': 32,
 }
 
 
@@ -1102,6 +1096,7 @@ def _run_1f1b_profiler_with_5d_parallel(
     mocker,
     *,
     overlap_moe_expert_parallel_comm: bool = True,
+    use_staggered: bool = False,
 ):
     """Shared implementation for 5D-parallel 1F1B profiler tests.
 
@@ -1119,13 +1114,23 @@ def _run_1f1b_profiler_with_5d_parallel(
         pytest.skip("Requires WORLD_SIZE to be a multiple of 8 for tp=2, cp=2, ep=2, pp=2")
 
     from megatron.core.enums import ModelType
+    from megatron.core.models.common.model_chunk_schedule_plan import (
+        StaggeredTransformerModelChunkSchedulePlan,
+    )
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
-    tag = "baseline" if overlap_moe_expert_parallel_comm else "interleaved"
+    if use_staggered:
+        tag = "staggered"
+    else:
+        tag = "baseline" if overlap_moe_expert_parallel_comm else "interleaved"
     trace_env = (
-        'BASELINE_1F1B_TRACE_DIR'
-        if overlap_moe_expert_parallel_comm
-        else 'INTERLEAVED_1F1B_TRACE_DIR'
+        'STAGGERED_1F1B_TRACE_DIR'
+        if use_staggered
+        else (
+            'BASELINE_1F1B_TRACE_DIR'
+            if overlap_moe_expert_parallel_comm
+            else 'INTERLEAVED_1F1B_TRACE_DIR'
+        )
     )
     trace_dir = _normalize_schedule_test_trace_dir(os.environ.get(trace_env))
 
@@ -1152,13 +1157,19 @@ def _run_1f1b_profiler_with_5d_parallel(
     if model_params['model_dir'] is not None:
         _debug_log(f"using structural params from {model_params['model_dir']}")
 
-    os.environ.pop('STAGGERED_1F1B', None)
+    if use_staggered:
+        os.environ['STAGGERED_1F1B'] = '1'
+    else:
+        os.environ.pop('STAGGERED_1F1B', None)
+    StaggeredTransformerModelChunkSchedulePlan._pending_bwd_state = None
+    StaggeredTransformerModelChunkSchedulePlan._deferred_grad_getter = None
     os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0'
     os.environ['NVTE_FLASH_ATTN'] = '1'
     os.environ['NVTE_FUSED_ATTN'] = '0'
     os.environ['NVTE_UNFUSED_ATTN'] = '0'
     _debug_log(
-        f"mode overlap_moe_expert_parallel_comm={overlap_moe_expert_parallel_comm}"
+        f"mode overlap_moe_expert_parallel_comm={overlap_moe_expert_parallel_comm} "
+        f"use_staggered={use_staggered}"
     )
 
     _initialize_model_parallel_for_torchrun(
@@ -1488,6 +1499,7 @@ def _run_1f1b_profiler_with_5d_parallel(
             f.write(
                 f"overlap_moe_expert_parallel_comm={overlap_moe_expert_parallel_comm}\n"
             )
+            f.write(f"use_staggered={use_staggered}\n")
             f.write(f"delay_wgrad_compute={config.delay_wgrad_compute}\n\n")
             f.write(f"## Overall Performance (excluding Unit 0)\n")
             f.write(f"Valid Total Time = {valid_total_time_ms:.4f} ms\n")
@@ -1555,4 +1567,14 @@ def test_interleaved_1f1b_profiler_without_combined_with_5d_parallel(mocker):
     _run_1f1b_profiler_with_5d_parallel(
         mocker,
         overlap_moe_expert_parallel_comm=False,
+    )
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_staggered_1f1b_profiler_with_5d_parallel(mocker):
+    _run_1f1b_profiler_with_5d_parallel(
+        mocker,
+        overlap_moe_expert_parallel_comm=True,
+        use_staggered=True,
     )
