@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
-import logging
 import os
 from contextlib import nullcontext
 from typing import List, Union
@@ -16,22 +15,6 @@ from megatron.core.utils import get_attr_wrapped_model
 # Types
 Shape = Union[List[int], torch.Size]
 _DEFERRED_GRAD = object()
-logger = logging.getLogger(__name__)
-
-
-def _staggered_debug_enabled() -> bool:
-    return os.getenv("NE_STAGGERED_1F1B_LOG", "0") == "1"
-
-
-def _dist_rank() -> int:
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank()
-    return -1
-
-
-def _slog(msg: str, *args):
-    if _staggered_debug_enabled():
-        logger.info("[Staggered1F1B][rank=%s] " + msg, _dist_rank(), *args)
 
 
 def combined_1f1b_schedule_for_no_pipelining(
@@ -193,12 +176,6 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     """
 
     set_streams()
-    if os.getenv("STAGGERED_1F1B", "0") == "1":
-        _slog(
-            "combined enter f_vmb=%s b_vmb=%s",
-            f_virtual_microbatch_id,
-            b_virtual_microbatch_id,
-        )
     # forward prepare
     f_model_chunk_id = None
     f_microbatch_id = None
@@ -235,12 +212,6 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
                 b_output_tensor_grad_deferred = (
                     b_schedule_plan_type is not None and is_backward_deferred()
                 )
-            _slog(
-                "combined deferred grad detected b_vmb=%s steady=%s deferred_flag=%s",
-                b_virtual_microbatch_id,
-                is_steady_state,
-                b_output_tensor_grad_deferred,
-            )
             b_output_tensor_grad = None
     # Call combined forward and backward step to overlap the communication and computation
     output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
@@ -284,16 +255,8 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
             and is_steady_state
             and getattr(schedule_plan_type, "is_backward_deferred", lambda: False)()
         )
-        if os.getenv("STAGGERED_1F1B", "0") == "1":
-            _slog(
-                "combined post b_vmb=%s backward_actually_deferred=%s",
-                b_virtual_microbatch_id,
-                backward_actually_deferred,
-            )
         if not backward_actually_deferred and b_input_tensor is not None:
             assert input_tensor_grad is not None
-    if os.getenv("STAGGERED_1F1B", "0") == "1":
-        _slog("combined exit f_vmb=%s b_vmb=%s", f_virtual_microbatch_id, b_virtual_microbatch_id)
     return output_tensor, input_tensor_grad
 
 
