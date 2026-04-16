@@ -40,9 +40,9 @@ rank = Utils.rank
 _DEFAULT_QWEN_MODEL_DIR = '/data/common/models/Qwen/Qwen3-30B-A3B-Base'
 
 _SCHEDULE_TEST_MODEL_PARAM_OVERRIDES = {
-    'seq_length': 4096,
+    'seq_length': 8192,
     'num_hidden_layers': 16,
-    'num_microbatches': 16,
+    'num_microbatches': 32,
 }
 
 
@@ -56,6 +56,34 @@ def _debug_log(message):
         file=sys.stderr,
         flush=True,
     )
+
+
+def _heartbeat_log(phase, step, total_steps, tag):
+    """Low-frequency progress log to show test is moving."""
+    if os.environ.get('SCHEDULE_TEST_HEARTBEAT', '1') == '0':
+        return
+    rank = int(os.environ.get('RANK', '0'))
+    if rank != 0:
+        return
+    interval = int(os.environ.get('SCHEDULE_TEST_HEARTBEAT_INTERVAL', '3'))
+    if interval < 1:
+        interval = 1
+    # For short tests (e.g., warmup=2/profile=3), print every step by default.
+    effective_interval = 1 if total_steps <= 8 else interval
+    if step == 0 or (step + 1) % effective_interval == 0 or (step + 1) == total_steps:
+        mem_suffix = ""
+        if torch.cuda.is_available():
+            cur_alloc_mib = torch.cuda.memory_allocated() / (1024.0 * 1024.0)
+            peak_alloc_mib = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+            mem_suffix = (
+                f" | mem_alloc={cur_alloc_mib:.1f}MiB"
+                f" peak_alloc={peak_alloc_mib:.1f}MiB"
+            )
+        print(
+            f"[schedule_test][heartbeat][{tag}] {phase} step {step + 1}/{total_steps}{mem_suffix}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _bytes_to_mib(num_bytes):
@@ -1135,8 +1163,8 @@ def _run_1f1b_profiler_with_5d_parallel(
     trace_dir = _normalize_schedule_test_trace_dir(os.environ.get(trace_env))
 
     tp_size = 2
-    cp_size = 2
-    ep_size = 4
+    cp_size = 4
+    ep_size = 8
     etp_size = 1
     pp_size = 2
     vpp_size = 2
@@ -1193,9 +1221,25 @@ def _run_1f1b_profiler_with_5d_parallel(
 
     use_deepep = _should_enable_deepep(ep_size)
     moe_dispatcher_type = "flex" if use_deepep else "alltoall"
+    fine_grained_offload = os.environ.get("SCHEDULE_FINE_GRAINED_OFFLOAD", "0") == "1"
+    offload_modules = []
+    if fine_grained_offload:
+        offload_modules = [
+            "attn_norm",
+            "qkv_linear",
+            "core_attn",
+            "attn_proj",
+            "mlp_norm",
+            "expert_fc1",
+            "moe_act",
+        ]
     _debug_log(
         f"EP backend decision: EP_INTRANODE_BACKEND={os.environ.get('EP_INTRANODE_BACKEND', '<unset>')} "
         f"use_deepep={use_deepep} moe_dispatcher_type={moe_dispatcher_type}"
+    )
+    _debug_log(
+        f"fine_grained_activation_offloading={fine_grained_offload} "
+        f"offload_modules={offload_modules}"
     )
 
     config = TransformerConfig(
@@ -1229,6 +1273,8 @@ def _run_1f1b_profiler_with_5d_parallel(
         batch_p2p_comm=False,
         sequence_parallel=(tp_size > 1),
         delay_wgrad_compute=overlap_moe_expert_parallel_comm,
+        fine_grained_activation_offloading=fine_grained_offload,
+        offload_modules=offload_modules,
     )
     config.num_query_groups = model_params['num_query_groups']
     config.moe_ffn_hidden_size = model_params['moe_ffn_hidden_size']
@@ -1364,6 +1410,7 @@ def _run_1f1b_profiler_with_5d_parallel(
 
     _debug_log(f"starting {num_warmup_steps} warmup steps ({tag})")
     for step in range(num_warmup_steps):
+        _heartbeat_log("warmup", step, num_warmup_steps, tag)
         _ = run_profiled_forward_backward_step(record_unit=not overlap_moe_expert_parallel_comm)
         
     torch.cuda.synchronize()
@@ -1374,12 +1421,48 @@ def _run_1f1b_profiler_with_5d_parallel(
     gpu_events.clear()
     _debug_log(f"warmup complete, metrics cleared.")
 
+    current_rank = dist.get_rank()
+    profiler_ranks_env = os.environ.get("SCHEDULE_PROFILER_RANKS", "0").strip()
+    if profiler_ranks_env.lower() in {"all", "*"}:
+        profiler_enabled_ranks = set(range(world_size))
+    else:
+        profiler_enabled_ranks = set()
+        if profiler_ranks_env:
+            for token in profiler_ranks_env.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                profiler_enabled_ranks.add(int(token))
+    profiler_enabled = current_rank in profiler_enabled_ranks
+    _debug_log(
+        f"profiler rank config env='{profiler_ranks_env}' "
+        f"enabled={profiler_enabled} enabled_ranks={sorted(profiler_enabled_ranks)}"
+    )
     _debug_log(f"torch profiler start for {num_profile_steps} steps ({tag})")
     try:
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-        ) as prof:
+        # All profiler-enabled ranks collect only the first post-warmup profile step.
+        # Remaining profile steps execute without torch.profiler.
+        if profiler_enabled:
+            prof = None
             for step in range(num_profile_steps):
+                _heartbeat_log("profile", step, num_profile_steps, tag)
+                if step == 0:
+                    with torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+                    ) as prof:
+                        losses_reduced = run_profiled_forward_backward_step(
+                            record_unit=not overlap_moe_expert_parallel_comm
+                        )
+                else:
+                    losses_reduced = run_profiled_forward_backward_step(
+                        record_unit=not overlap_moe_expert_parallel_comm
+                    )
+            assert prof is not None
+        else:
+            # Profiler-disabled ranks avoid torch.profiler buffers to reduce host-memory usage.
+            prof = None
+            for step in range(num_profile_steps):
+                _heartbeat_log("profile", step, num_profile_steps, tag)
                 losses_reduced = run_profiled_forward_backward_step(
                     record_unit=not overlap_moe_expert_parallel_comm
                 )
@@ -1400,7 +1483,6 @@ def _run_1f1b_profiler_with_5d_parallel(
     local_unit_ms = sum(unit_wall_times_ms) / unit_count
     assert local_unit_ms > 0.0
 
-    current_rank = dist.get_rank()
     is_last_pp_stage = parallel_state.is_pipeline_last_stage(ignore_virtual=True)
 
     if is_last_pp_stage:
@@ -1428,51 +1510,73 @@ def _run_1f1b_profiler_with_5d_parallel(
     if trace_dir:
         os.makedirs(trace_dir, exist_ok=True)
         rank_prefix = os.path.join(trace_dir, f'{tag}_1f1b_rank{current_rank}')
+        export_json_pickle = current_rank == 0
         chrome_trace_path = f'{rank_prefix}.json'
-        chrome_trace_display_path = _repo_display_path(chrome_trace_path)
+        chrome_trace_display_path = (
+            _repo_display_path(chrome_trace_path) if export_json_pickle else 'rank0_only'
+        )
         memory_phase_stats.append(_collect_cuda_memory_stats('pre_export'))
         memory_snapshot_path = f'{rank_prefix}_memory_snapshot.pickle'
-        memory_snapshot_display_path = _repo_display_path(memory_snapshot_path)
-        memory_snapshot_dumped, memory_snapshot_error = _try_dump_cuda_memory_snapshot(
-            memory_snapshot_path
+        memory_snapshot_display_path = (
+            _repo_display_path(memory_snapshot_path) if export_json_pickle else 'rank0_only'
         )
+        if export_json_pickle:
+            memory_snapshot_dumped, memory_snapshot_error = _try_dump_cuda_memory_snapshot(
+                memory_snapshot_path
+            )
+        else:
+            memory_snapshot_dumped, memory_snapshot_error = False, None
         memory_stats_path = f'{rank_prefix}_memory_stats.json'
         memory_summary_path = f'{rank_prefix}_memory_summary.txt'
-        memory_stats_display_path = _repo_display_path(memory_stats_path)
+        memory_stats_display_path = (
+            _repo_display_path(memory_stats_path) if export_json_pickle else 'rank0_only'
+        )
         memory_summary_display_path = _repo_display_path(memory_summary_path)
 
-        with open(memory_stats_path, 'w') as f:
-            json.dump(
-                {
-                    'rank': current_rank,
-                    'tag': tag,
-                    'trace_dir': _repo_display_path(trace_dir),
-                    'chrome_trace_path': chrome_trace_display_path,
-                    'memory_history': memory_history_info,
-                    'snapshot_dumped': memory_snapshot_dumped,
-                    'snapshot_path': memory_snapshot_display_path if memory_snapshot_dumped else None,
-                    'snapshot_error': memory_snapshot_error,
-                    'memory_stats_path': memory_stats_display_path,
-                    'memory_summary_path': memory_summary_display_path,
-                    'phases': memory_phase_stats,
-                },
-                f,
-                indent=2,
+        if export_json_pickle:
+            with open(memory_stats_path, 'w') as f:
+                json.dump(
+                    {
+                        'rank': current_rank,
+                        'tag': tag,
+                        'trace_dir': _repo_display_path(trace_dir),
+                        'chrome_trace_path': chrome_trace_display_path,
+                        'memory_history': memory_history_info,
+                        'snapshot_dumped': memory_snapshot_dumped,
+                        'snapshot_path': memory_snapshot_display_path if memory_snapshot_dumped else None,
+                        'snapshot_error': memory_snapshot_error,
+                        'memory_stats_path': memory_stats_display_path,
+                        'memory_summary_path': memory_summary_display_path,
+                        'phases': memory_phase_stats,
+                    },
+                    f,
+                    indent=2,
+                )
+            _debug_log(f"memory stats exported to {memory_stats_path}")
+        else:
+            _debug_log(
+                f"skip json/pickle export on rank={current_rank}; only rank0 exports json/pickle"
             )
-        _debug_log(f"memory stats exported to {memory_stats_path}")
 
         with open(memory_summary_path, 'w') as f:
             f.write(torch.cuda.memory_summary())
         _debug_log(f"memory summary exported to {memory_summary_path}")
 
-        # 1. Chrome trace JSON
-        prof.export_chrome_trace(chrome_trace_path)
-        _debug_log(f"chrome trace exported to {chrome_trace_path}")
+        # 1. Chrome trace JSON (rank0 only, first profile step only)
+        if export_json_pickle and prof is not None:
+            prof.export_chrome_trace(chrome_trace_path)
+            _debug_log(f"chrome trace exported to {chrome_trace_path}")
 
-        # 2. Profiler key averages table (kernel-level CPU/CUDA timing)
-        key_avg_table = prof.key_averages().table(
-            sort_by="cuda_time_total", row_limit=100
-        )
+        # 2. Profiler key averages table (only for ranks in SCHEDULE_PROFILER_RANKS)
+        if prof is not None:
+            key_avg_table = prof.key_averages().table(
+                sort_by="cuda_time_total", row_limit=100
+            )
+        else:
+            key_avg_table = (
+                "Profiler key averages are disabled for this rank "
+                "(not in SCHEDULE_PROFILER_RANKS).\n"
+            )
         with open(f'{rank_prefix}_key_averages.txt', 'w') as f:
             f.write(key_avg_table)
         _debug_log(f"key averages exported to {rank_prefix}_key_averages.txt")

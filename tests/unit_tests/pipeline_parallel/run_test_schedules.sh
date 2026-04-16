@@ -21,8 +21,8 @@ MASTER_PORT=${MASTER_PORT:-29500}
 
 TEST_TARGET=tests/unit_tests/pipeline_parallel/test_schedules.py
 # TEST_FILTER=test_interleaved_1f1b_profiler_without_combined_with_5d_parallel
-# TEST_FILTER=test_staggered_1f1b_profiler_with_5d_parallel
-TEST_FILTER=${TEST_FILTER:-test_baseline_1f1b_profiler_with_5d_parallel}
+TEST_FILTER=test_staggered_1f1b_profiler_with_5d_parallel
+# TEST_FILTER=${TEST_FILTER:-test_baseline_1f1b_profiler_with_5d_parallel}
 # export NE_STAGGERED_1F1B_LOG=0
 
 PYTEST_ARGS=${PYTEST_ARGS:---tb=long -rA --full-trace}
@@ -52,6 +52,11 @@ export TORCH_DISABLE_ADDR2LINE=${TORCH_DISABLE_ADDR2LINE:-1}
 export TORCH_DISTRIBUTED_DEBUG=${TORCH_DISTRIBUTED_DEBUG:-INFO}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export SCHEDULE_TEST_DEBUG
+export SCHEDULE_TEST_BWD_DONE_LOG=${SCHEDULE_TEST_BWD_DONE_LOG:-1}
+export SCHEDULE_PROFILER_RANKS=${SCHEDULE_PROFILER_RANKS:-0}
+export SCHEDULE_FINE_GRAINED_OFFLOAD=0
+# export SCHEDULE_FINE_GRAINED_OFFLOAD=${SCHEDULE_FINE_GRAINED_OFFLOAD:-1}
+export SCHEDULE_OFFLOAD_MODULES=${SCHEDULE_OFFLOAD_MODULES:-attn_norm,qkv_linear,core_attn,attn_proj,mlp_norm,expert_fc1,moe_act}
 
 NPROC_PER_NODE=${NPROC_PER_NODE:-${DEFAULT_NPROC_PER_NODE}}
 
@@ -71,6 +76,8 @@ echo "[run_test_schedules] nnodes=${NNODES} node_rank=${NODE_RANK} nproc_per_nod
 echo "[run_test_schedules] master=${MASTER_ADDR}:${MASTER_PORT}"
 echo "[run_test_schedules] test_target=${TEST_TARGET} filter=${TEST_FILTER}"
 echo "[run_test_schedules] trace_dir=${TRACE_DIR}"
+echo "[run_test_schedules] profiler_ranks=${SCHEDULE_PROFILER_RANKS} (global ranks)"
+echo "[run_test_schedules] fine_grained_offload=${SCHEDULE_FINE_GRAINED_OFFLOAD} modules=${SCHEDULE_OFFLOAD_MODULES}"
 
 exec torchrun \
     --nnodes="${NNODES}" \

@@ -1695,6 +1695,20 @@ def forward_backward_pipelining_with_interleaving(
                             recv_next_wait_handle = recv_next_wait_handles.pop(0)
                             recv_next_wait_handle.wait()
 
+            def _maybe_log_backward_done(bwd_k, vp_stage):
+                if os.getenv("SCHEDULE_TEST_BWD_DONE_LOG", "0") != "1":
+                    return
+                if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                    return
+                if torch.distributed.get_rank() != 0:
+                    return
+                if vp_stage == 1:
+                    return
+                print(
+                    f"[schedule_test][rank0] backward microbatch done: bwd_k={bwd_k}, vp_stage={vp_stage}",
+                    flush=True,
+                )
+
             # Async backward send / receive (baseline path)
             def pp_post_backward_baseline(input_tensor_grad, vp_stage=None):
                 nonlocal send_prev_wait_handle
@@ -1737,6 +1751,7 @@ def forward_backward_pipelining_with_interleaving(
                         bwd_recv_buffer[backward_k % bwd_recv_buffer_size]
                     )
                     bwd_recv_buffer[(backward_k + 1) % bwd_recv_buffer_size] = None
+                _maybe_log_backward_done(backward_k, vp_stage)
                 return input_tensor_grad
 
             # Async backward send / receive (staggered path):
@@ -1782,6 +1797,7 @@ def forward_backward_pipelining_with_interleaving(
                         bwd_recv_buffer[bk % bwd_recv_buffer_size]
                     )
                     bwd_recv_buffer[(bk + 1) % bwd_recv_buffer_size] = None
+                _maybe_log_backward_done(bk, vp_stage)
                 return input_tensor_grad
 
             use_staggered_post_backward = os.getenv("STAGGERED_1F1B", "0") == "1"
