@@ -40,8 +40,8 @@ rank = Utils.rank
 _DEFAULT_QWEN_MODEL_DIR = '/data/common/models/Qwen/Qwen3-30B-A3B-Base'
 
 _SCHEDULE_TEST_MODEL_PARAM_OVERRIDES = {
-    'seq_length': 8192,
-    'num_hidden_layers': 16,
+    'seq_length': 6144,
+    'num_hidden_layers': 8,
     'num_microbatches': 32,
 }
 
@@ -1163,8 +1163,8 @@ def _run_1f1b_profiler_with_5d_parallel(
     trace_dir = _normalize_schedule_test_trace_dir(os.environ.get(trace_env))
 
     tp_size = 2
-    cp_size = 4
-    ep_size = 8
+    cp_size = 2
+    ep_size = 4
     etp_size = 1
     pp_size = 2
     vpp_size = 2
