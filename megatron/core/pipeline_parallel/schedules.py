@@ -1702,8 +1702,6 @@ def forward_backward_pipelining_with_interleaving(
                     return
                 if torch.distributed.get_rank() != 0:
                     return
-                if vp_stage == 1:
-                    return
                 print(
                     f"[schedule_test][rank0] backward microbatch done: bwd_k={bwd_k}, vp_stage={vp_stage}",
                     flush=True,
