@@ -803,7 +803,14 @@ class StaggeredTransformerModelChunkSchedulePlan(TransformerModelChunkSchedulePl
 
         for i in range(f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
-            b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
+            # Keep backward layer-0 in the plan for deferred dispatch/dw path.
+            # Other backward layers can be popped and released early.
+            if i < b_num_layers - 1:
+                b_layer = b_schedule_plan.pop_layer()
+                popped_for_release = True
+            else:
+                b_layer = b_schedule_plan.get_layer(0)
+                popped_for_release = False
             with _torch_profiler_range(f"Staggered_F{i}_B{b_num_layers - 1 - i}_P2"):
                 f_input, b_grad = StaggeredTransformerLayerSchedulePlan.run_staggered_part_2(
                     f_layer,
@@ -822,6 +829,10 @@ class StaggeredTransformerModelChunkSchedulePlan(TransformerModelChunkSchedulePl
                         b_grad=b_grad,
                         is_last_layer_in_bwd=False,
                     )
+            # Keep only layer-0 backward state for deferred execution in next microbatch.
+            # Other backward layers are finished in this iteration and can be released early.
+            if popped_for_release:
+                b_layer.release_state()
 
         if f_schedule_plan is not None and post_forward is not None:
             with torch.cuda.stream(_resolve_pp_stream()):
