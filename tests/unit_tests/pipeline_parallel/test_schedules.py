@@ -40,7 +40,7 @@ rank = Utils.rank
 _DEFAULT_QWEN_MODEL_DIR = '/data/common/models/Qwen/Qwen3-30B-A3B-Base'
 
 _SCHEDULE_TEST_MODEL_PARAM_OVERRIDES = {
-    'seq_length': 6144,
+    'seq_length': 4096,
     'num_hidden_layers': 8,
     'num_microbatches': 32,
 }
@@ -56,6 +56,17 @@ def _debug_log(message):
         file=sys.stderr,
         flush=True,
     )
+
+
+def _maybe_fail_fast_abort(exc: BaseException):
+    """Abort this worker immediately when fail-fast is enabled."""
+    _debug_log(f"fail-fast triggered: {type(exc).__name__}: {exc}")
+    traceback.print_exc()
+    sys.stderr.flush()
+    if os.environ.get("SCHEDULE_TEST_FAIL_FAST", "1") != "1":
+        return
+    # Hard-exit current worker to avoid long distributed hang after first failure.
+    os._exit(1)
 
 
 def _heartbeat_log(phase, step, total_steps, tag):
@@ -1438,6 +1449,10 @@ def _run_1f1b_profiler_with_5d_parallel(
         f"profiler rank config env='{profiler_ranks_env}' "
         f"enabled={profiler_enabled} enabled_ranks={sorted(profiler_enabled_ranks)}"
     )
+    # End-to-end throughput should be measured with synchronized step timing
+    # and reduced by MAX across ranks (slowest rank decides global throughput).
+    profile_step_local_ms = []
+    profile_step_global_max_ms = []
     _debug_log(f"torch profiler start for {num_profile_steps} steps ({tag})")
     try:
         # All profiler-enabled ranks collect only the first post-warmup profile step.
@@ -1446,6 +1461,8 @@ def _run_1f1b_profiler_with_5d_parallel(
             prof = None
             for step in range(num_profile_steps):
                 _heartbeat_log("profile", step, num_profile_steps, tag)
+                torch.cuda.synchronize()
+                step_start = time.perf_counter()
                 if step == 0:
                     with torch.profiler.profile(
                         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
@@ -1457,15 +1474,29 @@ def _run_1f1b_profiler_with_5d_parallel(
                     losses_reduced = run_profiled_forward_backward_step(
                         record_unit=not overlap_moe_expert_parallel_comm
                     )
+                torch.cuda.synchronize()
+                local_step_ms = (time.perf_counter() - step_start) * 1000.0
+                profile_step_local_ms.append(local_step_ms)
+                step_ms_tensor = torch.tensor(local_step_ms, device=torch.cuda.current_device())
+                dist.all_reduce(step_ms_tensor, op=dist.ReduceOp.MAX)
+                profile_step_global_max_ms.append(float(step_ms_tensor.item()))
             assert prof is not None
         else:
             # Profiler-disabled ranks avoid torch.profiler buffers to reduce host-memory usage.
             prof = None
             for step in range(num_profile_steps):
                 _heartbeat_log("profile", step, num_profile_steps, tag)
+                torch.cuda.synchronize()
+                step_start = time.perf_counter()
                 losses_reduced = run_profiled_forward_backward_step(
                     record_unit=not overlap_moe_expert_parallel_comm
                 )
+                torch.cuda.synchronize()
+                local_step_ms = (time.perf_counter() - step_start) * 1000.0
+                profile_step_local_ms.append(local_step_ms)
+                step_ms_tensor = torch.tensor(local_step_ms, device=torch.cuda.current_device())
+                dist.all_reduce(step_ms_tensor, op=dist.ReduceOp.MAX)
+                profile_step_global_max_ms.append(float(step_ms_tensor.item()))
     except Exception as exc:
         _debug_log(f"forward_backward_func failed: {type(exc).__name__}: {exc}")
         _debug_log(traceback.format_exc())
@@ -1490,8 +1521,14 @@ def _run_1f1b_profiler_with_5d_parallel(
     else:
         assert losses_reduced == []
     valid_total_time_ms = sum(unit_wall_times_ms)
+    global_step_max_total_time_ms = sum(profile_step_global_max_ms)
+    local_step_total_time_ms = sum(profile_step_local_ms)
     total_tokens = seq_length * micro_batch_size * num_microbatches * num_profile_steps
-    throughput_tps = (total_tokens / (valid_total_time_ms / 1000.0)) if valid_total_time_ms > 0 else 0.0
+    throughput_tps = (
+        total_tokens / (global_step_max_total_time_ms / 1000.0)
+        if global_step_max_total_time_ms > 0
+        else 0.0
+    )
     _debug_log(
         f"local_unit_count={unit_count} local_unit_ms={local_unit_ms:.6f}"
     )
@@ -1500,7 +1537,9 @@ def _run_1f1b_profiler_with_5d_parallel(
         f"[{tag}_1f1b_profiler] "
         f"rank={current_rank} world_size={world_size} tp={tp_size} cp={cp_size} ep={ep_size} pp={pp_size} "
         f"vpp={vpp_size} unit_count={unit_count} \n"
-        f"    => Valid Total Time (Profile Steps Only): {valid_total_time_ms:.2f} ms\n"
+        f"    => Unit Valid Total Time (async, profile units): {valid_total_time_ms:.2f} ms\n"
+        f"    => Local Profile Step Time (sync): {local_step_total_time_ms:.2f} ms\n"
+        f"    => Global Max Profile Step Time (sync): {global_step_max_total_time_ms:.2f} ms\n"
         f"    => Throughput: {throughput_tps:.2f} tokens/sec"
     )
     print(summary_line)
@@ -1606,7 +1645,9 @@ def _run_1f1b_profiler_with_5d_parallel(
             f.write(f"use_staggered={use_staggered}\n")
             f.write(f"delay_wgrad_compute={config.delay_wgrad_compute}\n\n")
             f.write(f"## Overall Performance (excluding Unit 0)\n")
-            f.write(f"Valid Total Time = {valid_total_time_ms:.4f} ms\n")
+            f.write(f"Unit Valid Total Time (async, profile units) = {valid_total_time_ms:.4f} ms\n")
+            f.write(f"Local Profile Step Time (sync) = {local_step_total_time_ms:.4f} ms\n")
+            f.write(f"Global Max Profile Step Time (sync) = {global_step_max_total_time_ms:.4f} ms\n")
             f.write(f"Total Tokens = {total_tokens}\n")
             f.write(f"Throughput = {throughput_tps:.2f} tokens/sec\n\n")
             f.write(f"## CUDA memory recording\n")
@@ -1662,23 +1703,35 @@ def _run_1f1b_profiler_with_5d_parallel(
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_baseline_1f1b_profiler_with_5d_parallel(mocker):
-    _run_1f1b_profiler_with_5d_parallel(mocker)
+    try:
+        _run_1f1b_profiler_with_5d_parallel(mocker)
+    except Exception as exc:
+        _maybe_fail_fast_abort(exc)
+        raise
 
 
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_interleaved_1f1b_profiler_without_combined_with_5d_parallel(mocker):
-    _run_1f1b_profiler_with_5d_parallel(
-        mocker,
-        overlap_moe_expert_parallel_comm=False,
-    )
+    try:
+        _run_1f1b_profiler_with_5d_parallel(
+            mocker,
+            overlap_moe_expert_parallel_comm=False,
+        )
+    except Exception as exc:
+        _maybe_fail_fast_abort(exc)
+        raise
 
 
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_staggered_1f1b_profiler_with_5d_parallel(mocker):
-    _run_1f1b_profiler_with_5d_parallel(
-        mocker,
-        overlap_moe_expert_parallel_comm=True,
-        use_staggered=True,
-    )
+    try:
+        _run_1f1b_profiler_with_5d_parallel(
+            mocker,
+            overlap_moe_expert_parallel_comm=True,
+            use_staggered=True,
+        )
+    except Exception as exc:
+        _maybe_fail_fast_abort(exc)
+        raise
