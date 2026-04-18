@@ -732,12 +732,13 @@ class StaggeredTransformerModelChunkSchedulePlan(TransformerModelChunkSchedulePl
 
         f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
         pending_state = StaggeredTransformerModelChunkSchedulePlan._pending_bwd_state
-        prev_b_plan = pending_state["plan"] if pending_state is not None else None
+        prev_b_layer_0 = pending_state["layer0"] if pending_state is not None else None
+        prev_b_pre_process = pending_state["pre_process"] if pending_state is not None else None
+        prev_b_event = pending_state["event"] if pending_state is not None else None
+        prev_b_vp_stage = pending_state["vp_stage"] if pending_state is not None else None
         prev_b_grad = pending_state["grad"] if pending_state is not None else None
-        prev_num_layers = prev_b_plan.num_layers() if prev_b_plan is not None else 0
 
         f_layer_0 = f_schedule_plan.get_layer(0) if f_num_layers > 0 else None
-        prev_b_layer_0 = prev_b_plan.get_layer(0) if prev_num_layers > 0 else None
         is_first_steady = prev_b_layer_0 is None
 
         if f_layer_0 is not None or prev_b_layer_0 is not None:
@@ -751,11 +752,12 @@ class StaggeredTransformerModelChunkSchedulePlan(TransformerModelChunkSchedulePl
                 )
 
         stored_post_backward = pending_state.get("post_backward") if pending_state is not None else None
-        if prev_b_plan is not None and stored_post_backward is not None:
+        if prev_b_layer_0 is not None and stored_post_backward is not None:
             with torch.cuda.stream(_resolve_pp_stream()):
-                prev_b_plan.wait_current_stream()
+                if prev_b_event is not None:
+                    prev_b_event.wait(torch.cuda.current_stream())
                 with _torch_profiler_range("PP_SEND(B)"):
-                    stored_post_backward(prev_b_grad, prev_b_plan.vp_stage)
+                    stored_post_backward(prev_b_grad, prev_b_vp_stage)
 
         if f_layer_0 is not None and not is_first_steady:
             with _torch_profiler_range("DISPATCH(F)"):
@@ -765,11 +767,16 @@ class StaggeredTransformerModelChunkSchedulePlan(TransformerModelChunkSchedulePl
             with _torch_profiler_range("ATTN(W)"):
                 prev_b_layer_0.attn.backward_dw()
 
-        if prev_b_plan is not None:
+        if prev_b_pre_process is not None:
             with _torch_profiler_range("PRE_PROCESS(B)"):
-                prev_b_plan.pre_process.backward(prev_b_grad)
-            prev_b_plan.wait_current_stream()
-            prev_b_plan.release_state()
+                prev_b_pre_process.backward(prev_b_grad)
+            if prev_b_event is not None:
+                prev_b_event.wait(torch.cuda.current_stream())
+            prev_b_layer_0.release_state()
+            # Release model-chunk state references held by preprocess node.
+            if hasattr(prev_b_pre_process, "model_chunk_state") and prev_b_pre_process.model_chunk_state is not None:
+                prev_b_pre_process.model_chunk_state.model = None
+                prev_b_pre_process.model_chunk_state = None
 
         StaggeredTransformerModelChunkSchedulePlan._pending_bwd_state = None
         return f_input
@@ -845,8 +852,20 @@ class StaggeredTransformerModelChunkSchedulePlan(TransformerModelChunkSchedulePl
                 b_grad = b_schedule_plan.get_layer(0).moe_dispatch.backward(b_grad)
             with _torch_profiler_range("MLP(W)"):
                 b_schedule_plan.get_layer(0).mlp.backward_dw()
+            pending_layer0 = b_schedule_plan.get_layer(0)
+            pending_pre_process = b_schedule_plan.pre_process
+            pending_event = b_schedule_plan.event
+            pending_vp_stage = b_schedule_plan.vp_stage
+            # Drop container references once pending payload is extracted.
+            b_schedule_plan._transformer_layers = []
+            b_schedule_plan.pre_process = None
+            b_schedule_plan.post_process = None
+            b_schedule_plan._model_chunk_state = None
             StaggeredTransformerModelChunkSchedulePlan._pending_bwd_state = {
-                "plan": b_schedule_plan,
+                "layer0": pending_layer0,
+                "pre_process": pending_pre_process,
+                "event": pending_event,
+                "vp_stage": pending_vp_stage,
                 "grad": b_grad,
                 "post_backward": post_backward,
             }
