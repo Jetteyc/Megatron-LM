@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -48,6 +49,25 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 """
 
 logger = logging.getLogger(__name__)
+_MOE_DISPATCH_DEBUG_COUNT = 0
+_MOE_DISPATCH_DEBUG_MAX = int(os.getenv("SCHEDULE_TEST_MOE_DISPATCH_DEBUG_MAX_LOGS", "512"))
+
+
+def _moe_dispatch_debug_enabled() -> bool:
+    return os.getenv("SCHEDULE_TEST_MOE_DISPATCH_DEBUG", "0") == "1"
+
+
+def _maybe_dispatch_debug_log(msg: str) -> None:
+    global _MOE_DISPATCH_DEBUG_COUNT
+    if not _moe_dispatch_debug_enabled() or _MOE_DISPATCH_DEBUG_COUNT >= _MOE_DISPATCH_DEBUG_MAX:
+        return
+    rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_available() and torch.distributed.is_initialized()
+        else -1
+    )
+    logger.info("[MoEDispatchDebug][rank=%s] %s", rank, msg)
+    _MOE_DISPATCH_DEBUG_COUNT += 1
 
 
 class MoETokenDispatcher:
@@ -291,6 +311,11 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         self.local_probs = probs[
             :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
         ].contiguous()
+        _maybe_dispatch_debug_log(
+            "AllGather.dispatch_postprocess local_map_shape="
+            f"{tuple(self.local_map.shape)} local_probs_shape={tuple(self.local_probs.shape)} "
+            f"hidden_shape_before_permute={tuple(self.hidden_shape_before_permute)}"
+        )
 
         tokens_per_expert = self.local_map.sum(dim=0).long().cpu()
 
@@ -301,8 +326,17 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             fused=self.config.moe_permute_fusion,
         )
 
-        self.local_probs = self.local_probs.T.contiguous().masked_select(
-            self.local_map.T.contiguous()
+        local_probs_t = self.local_probs.T.contiguous()
+        local_map_t = self.local_map.T.contiguous()
+        if local_probs_t.shape != local_map_t.shape:
+            raise RuntimeError(
+                "MoE dispatcher masked_select shape mismatch in AllGather dispatcher: "
+                f"local_probs_t={tuple(local_probs_t.shape)} local_map_t={tuple(local_map_t.shape)}"
+            )
+        self.local_probs = local_probs_t.masked_select(local_map_t)
+        _maybe_dispatch_debug_log(
+            "AllGather.dispatch_postprocess masked_select "
+            f"selected={int(self.local_probs.numel())} tokens_per_expert_sum={int(tokens_per_expert.sum().item())}"
         )
         self.routing_map = None
         return permuted_local_hidden_states, tokens_per_expert, self.local_probs
@@ -613,6 +647,19 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+        if hidden_states.size(0) != routing_map.size(0) or probs.size(0) != routing_map.size(0):
+            raise RuntimeError(
+                "MoE dispatcher dispatch_preprocess shape mismatch: "
+                f"hidden_tokens={hidden_states.size(0)} probs_tokens={probs.size(0)} "
+                f"routing_tokens={routing_map.size(0)} hidden_shape={tuple(hidden_states.shape)} "
+                f"probs_shape={tuple(probs.shape)} routing_shape={tuple(routing_map.shape)}"
+            )
+        _maybe_dispatch_debug_log(
+            "AllToAll.dispatch_preprocess "
+            f"hidden_shape={tuple(hidden_states.shape)} probs_shape={tuple(probs.shape)} "
+            f"routing_shape={tuple(routing_map.shape)} drop_and_pad={self.drop_and_pad} "
+            f"num_out_tokens={getattr(self, 'num_out_tokens', None)}"
+        )
 
         if self.config.moe_router_padding_for_quantization:
             pad_multiple = get_align_size_for_quantization(self.config)
@@ -641,6 +688,18 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             num_out_tokens=self.num_out_tokens,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
+        )
+        if permuted_probs is not None and permuted_probs.size(0) != permutated_local_input_tokens.size(0):
+            raise RuntimeError(
+                "MoE dispatcher permute output mismatch: "
+                f"permuted_tokens={tuple(permutated_local_input_tokens.shape)} "
+                f"permuted_probs={tuple(permuted_probs.shape)}"
+            )
+        _maybe_dispatch_debug_log(
+            "AllToAll.dispatch_preprocess after permute "
+            f"permuted_tokens={tuple(permutated_local_input_tokens.shape)} "
+            f"permuted_probs={tuple(permuted_probs.shape) if permuted_probs is not None else None} "
+            f"reverse_idx_shape={tuple(self.reversed_local_input_permutation_mapping.shape)}"
         )
         return permutated_local_input_tokens, permuted_probs
 
@@ -830,6 +889,22 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.post_forward_comm()
 
         # Unpermutation 1: AlltoAll output to output
+        if (
+            self.reversed_local_input_permutation_mapping is not None
+            and self.reversed_local_input_permutation_mapping.numel()
+            != permutated_local_input_tokens.size(0)
+        ):
+            raise RuntimeError(
+                "MoE dispatcher combine_postprocess mapping mismatch: "
+                f"reversed_mapping={tuple(self.reversed_local_input_permutation_mapping.shape)} "
+                f"permutated_local_input_tokens={tuple(permutated_local_input_tokens.shape)}"
+            )
+        _maybe_dispatch_debug_log(
+            "AllToAll.combine_postprocess pre-unpermute "
+            f"tokens_shape={tuple(permutated_local_input_tokens.shape)} "
+            f"restore_shape={tuple(self.hidden_shape_before_permute)} "
+            f"routing_shape={tuple(self.routing_map.shape) if self.routing_map is not None else None}"
+        )
         output = unpermute(
             permutated_local_input_tokens,
             self.reversed_local_input_permutation_mapping,

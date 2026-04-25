@@ -1,7 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
+import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -41,6 +43,48 @@ except ImportError:
 
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
+_ROUTING_DEBUG_LOG_COUNT = 0
+_ROUTING_DEBUG_LOG_MAX = int(os.getenv("SCHEDULE_TEST_ROUTING_DEBUG_MAX_LOGS", "512"))
+logger = logging.getLogger(__name__)
+
+
+def _schedule_routing_debug_enabled() -> bool:
+    return os.getenv("SCHEDULE_TEST_ROUTING_DEBUG", "0") == "1"
+
+
+def _maybe_routing_debug_log(message: str) -> None:
+    global _ROUTING_DEBUG_LOG_COUNT
+    if not _schedule_routing_debug_enabled() or _ROUTING_DEBUG_LOG_COUNT >= _ROUTING_DEBUG_LOG_MAX:
+        return
+    _ROUTING_DEBUG_LOG_COUNT += 1
+    logger.info(message)
+
+
+def _validate_index_bounds(
+    *,
+    index: torch.Tensor,
+    upper_bound: int,
+    where: str,
+    extra: str = "",
+) -> None:
+    if index.numel() == 0:
+        return
+    min_idx = int(index.min().item())
+    max_idx = int(index.max().item())
+    if min_idx < 0 or max_idx >= upper_bound:
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else -1
+        )
+        raise RuntimeError(
+            f"{where} index out of range: rank={rank} min_idx={min_idx} max_idx={max_idx} "
+            f"upper_bound={upper_bound} index_shape={tuple(index.shape)} {extra}"
+        )
+    _maybe_routing_debug_log(
+        f"[MoEIndexDebug] where={where} min_idx={min_idx} max_idx={max_idx} "
+        f"upper_bound={upper_bound} index_shape={tuple(index.shape)} {extra}"
+    )
 
 
 def switch_load_balancing_loss_func(
@@ -356,6 +400,12 @@ def permute(
             indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
             indices_dim1 = sorted_indices.view(num_experts, capacity)
             indices_1D = (indices_dim0 * num_tokens + indices_dim1).view(-1)
+            _validate_index_bounds(
+                index=indices_1D,
+                upper_bound=probs_T_1D.size(0),
+                where="permute(drop_and_pad)/probs_index_select",
+                extra=f"num_tokens={num_tokens} num_experts={num_experts} capacity={capacity}",
+            )
             # get probs from indices
             permuted_probs = probs_T_1D.index_select(0, indices_1D)
     else:
@@ -372,6 +422,12 @@ def permute(
             permuted_probs = probs.T.contiguous().masked_select(routing_map)
 
     # use the mapping to permute the tokens
+    _validate_index_bounds(
+        index=sorted_indices,
+        upper_bound=num_tokens,
+        where="permute/tokens_index_select",
+        extra=f"tokens_shape={tuple(tokens.shape)} routing_map_shape={tuple(routing_map.shape)}",
+    )
     permuted_input = tokens.index_select(0, sorted_indices)
 
     return permuted_input, permuted_probs, sorted_indices
@@ -435,6 +491,15 @@ def unpermute(
             indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
             indices_dim1 = sorted_indices.view(num_experts, capacity)
             indices_1D = (indices_dim0 * num_unpermuted_tokens + indices_dim1).view(-1)
+            _validate_index_bounds(
+                index=indices_1D,
+                upper_bound=probs_T_1D.size(0),
+                where="unpermute(drop_and_pad)/probs_index_select",
+                extra=(
+                    f"num_unpermuted_tokens={num_unpermuted_tokens} num_experts={num_experts} "
+                    f"capacity={capacity}"
+                ),
+            )
 
             # get probs from indices
             permuted_probs = probs_T_1D.index_select(0, indices_1D)
@@ -458,9 +523,21 @@ def unpermute(
         )
         # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
         # and is CUDA graph compatible unlike scatter_add
+        _validate_index_bounds(
+            index=sorted_indices,
+            upper_bound=restore_shape[0],
+            where="unpermute/index_add",
+            extra=f"restore_shape={tuple(restore_shape)} permuted_tokens_shape={tuple(permuted_tokens.shape)}",
+        )
         output_tokens.index_add_(0, sorted_indices, permuted_tokens)
     else:
         # Scatter add the permuted_input back to the original positions
+        _validate_index_bounds(
+            index=sorted_indices,
+            upper_bound=restore_shape[0],
+            where="unpermute/scatter_add",
+            extra=f"restore_shape={tuple(restore_shape)} permuted_tokens_shape={tuple(permuted_tokens.shape)}",
+        )
         output_tokens.scatter_add_(
             0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
         )
@@ -727,6 +804,20 @@ def topk_routing_with_score_function(
 
     if scaling_factor:
         probs = probs * scaling_factor
+
+    # Validate top-k indices before scatter/index_put to fail early with useful context.
+    # This helps pinpoint intermittent device-side asserts from downstream scatter/gather.
+    if top_indices.numel() > 0:
+        _validate_index_bounds(
+            index=top_indices,
+            upper_bound=num_experts,
+            where="topk_routing_with_score_function/top_indices",
+            extra=(
+                f"num_tokens={num_tokens} num_experts={num_experts} topk={topk} "
+                f"score_function={score_function} use_pre_softmax={use_pre_softmax} "
+                f"group_topk={group_topk} logits_dtype={str(logits.dtype)} logits_shape={tuple(logits.shape)}"
+            ),
+        )
 
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]

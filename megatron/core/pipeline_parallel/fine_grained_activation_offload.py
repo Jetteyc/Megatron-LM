@@ -1,7 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+import os
 from typing import Any, Dict, Tuple
 
 import torch
@@ -21,6 +22,21 @@ def debug_rank(message):
     assert torch.distributed.is_initialized()
     if torch.distributed.get_rank() == DEBUG_RANK:
         print(message)
+
+
+@contextmanager
+def _fg_activation_profiler_range(name: str):
+    """Labels fine-grained activation D2H/H2D in torch.profiler Chrome JSON.
+
+    NVTX ranges alone are often weak or absent in exported profiler traces; record_function
+    shows up as cpu_op user annotations. Disabled when NE_RECORD_FUNCTION_DISABLE=1 (same as
+    schedule-plan profiler ranges).
+    """
+    if os.getenv("NE_RECORD_FUNCTION_DISABLE", "0") == "1":
+        yield
+        return
+    with torch.profiler.record_function(name):
+        yield
 
 
 def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
@@ -873,20 +889,23 @@ class ChunkOffloadHandler:
         """offload a group of tensors recorded in tensor_push()."""
         debug_rank("------bulk_offload_group")
         group_to_offload = self._groups_to_offload[-1]
-        torch.cuda.nvtx.range_push("activation offloading " + group_to_offload._name)
-        with torch.cuda.stream(self.d2h_stream):
-            for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
-                if self.tensor_need_offloading_checker(tensor_on_device):
-                    state = self.offload(
-                        tensor_on_device, use_cpu_pool=group_to_offload.use_cpu_pool
-                    )
-                    if self.is_warmup:
-                        group_to_offload.update_offload_info(tensor_on_device)
-                    tensor_on_device.record_stream(self.d2h_stream)
-                    group_to_offload.push_tensor(tensor_tag, state)
-            group_to_offload.record_offload_event(self.d2h_stream)
+        with _fg_activation_profiler_range(
+            f"[FG_act_offload] D2H group={group_to_offload._name}"
+        ):
+            torch.cuda.nvtx.range_push("activation offloading " + group_to_offload._name)
+            with torch.cuda.stream(self.d2h_stream):
+                for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
+                    if self.tensor_need_offloading_checker(tensor_on_device):
+                        state = self.offload(
+                            tensor_on_device, use_cpu_pool=group_to_offload.use_cpu_pool
+                        )
+                        if self.is_warmup:
+                            group_to_offload.update_offload_info(tensor_on_device)
+                        tensor_on_device.record_stream(self.d2h_stream)
+                        group_to_offload.push_tensor(tensor_tag, state)
+                group_to_offload.record_offload_event(self.d2h_stream)
+            torch.cuda.nvtx.range_pop()
         self._groups_to_offload.pop()
-        torch.cuda.nvtx.range_pop()
 
     def get_max_deduplicated_groups(self):
         """Get the maximum number of deduplicated groups."""
@@ -900,22 +919,25 @@ class ChunkOffloadHandler:
         """Bulk reload group."""
         debug_rank("----bulk_reload_group")
         group_to_reload = self._groups_to_reload[-1]
-        torch.cuda.nvtx.range_push("activation reloading " + group_to_reload._name)
-        with torch.cuda.stream(self.h2d_stream):
-            # Wait for offload to complete before reloading
-            if not is_graph_capturing():
-                group_to_reload.wait_offload_event(self.h2d_stream)
-            for tensor_tag, state in group_to_reload._tensors.items():
-                # Only reload if tensor was offloaded (stored as tuple)
-                if isinstance(state, tuple):
-                    recovered_tensor = self.reload(state)
-                    debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
-                    group_to_reload.push_tensor(tensor_tag, recovered_tensor)
-            group_to_reload.record_reload_event(self.h2d_stream)
+        with _fg_activation_profiler_range(
+            f"[FG_act_offload] H2D group={group_to_reload._name}"
+        ):
+            torch.cuda.nvtx.range_push("activation reloading " + group_to_reload._name)
+            with torch.cuda.stream(self.h2d_stream):
+                # Wait for offload to complete before reloading
+                if not is_graph_capturing():
+                    group_to_reload.wait_offload_event(self.h2d_stream)
+                for tensor_tag, state in group_to_reload._tensors.items():
+                    # Only reload if tensor was offloaded (stored as tuple)
+                    if isinstance(state, tuple):
+                        recovered_tensor = self.reload(state)
+                        debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
+                        group_to_reload.push_tensor(tensor_tag, recovered_tensor)
+                group_to_reload.record_reload_event(self.h2d_stream)
+            torch.cuda.nvtx.range_pop()
         self._groups_to_reload.pop()
         # Add the group to the reloading group to wait for the reload event.
         self._reloading_group.append(group_to_reload)
-        torch.cuda.nvtx.range_pop()
 
     def pre_reload_last_layer(self):
         """Pre-reload the last layer of this chunk to hide reload latency."""

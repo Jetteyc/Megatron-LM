@@ -1,9 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import torch
 from torch.autograd import Variable
@@ -11,6 +12,51 @@ from torch.autograd import Variable
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank, make_viewless_tensor
 
 logger = logging.getLogger(__name__)
+_SCHEDULE_BWD_DEBUG_COUNT = 0
+_SCHEDULE_BWD_DEBUG_MAX = int(os.getenv("SCHEDULE_TEST_BWD_DEBUG_MAX_LOGS", "4096"))
+
+
+def _schedule_bwd_debug_enabled() -> bool:
+    return os.getenv("SCHEDULE_TEST_BWD_DEBUG", "0") == "1"
+
+
+def _tensor_summary(x):
+    if x is None:
+        return "None"
+    if isinstance(x, tuple):
+        return "(" + ", ".join(_tensor_summary(e) for e in x) + ")"
+    if isinstance(x, list):
+        return "[" + ", ".join(_tensor_summary(e) for e in x) + "]"
+    if isinstance(x, torch.Tensor):
+        shape = tuple(x.shape)
+        dtype = str(x.dtype).replace("torch.", "")
+        req = "T" if x.requires_grad else "F"
+        if x.numel() == 0:
+            return f"{shape}:{dtype}:req={req}:numel=0"
+        if x.dtype.is_floating_point:
+            finite = int(torch.isfinite(x).all().item())
+            mn = float(x.detach().min().item())
+            mx = float(x.detach().max().item())
+            return f"{shape}:{dtype}:req={req}:finite={finite}:min={mn:.4e}:max={mx:.4e}"
+        mn = int(x.detach().min().item())
+        mx = int(x.detach().max().item())
+        return f"{shape}:{dtype}:req={req}:min={mn}:max={mx}"
+    return type(x).__name__
+
+
+def _bwd_dbg(msg: Union[str, Callable[[], str]]) -> None:
+    """Log backward debug line. Pass a zero-arg callable to defer expensive tensor scans."""
+    global _SCHEDULE_BWD_DEBUG_COUNT
+    if not _schedule_bwd_debug_enabled() or _SCHEDULE_BWD_DEBUG_COUNT >= _SCHEDULE_BWD_DEBUG_MAX:
+        return
+    text = msg() if callable(msg) else msg
+    rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_available() and torch.distributed.is_initialized()
+        else -1
+    )
+    logger.info("[ScheduleBwdDebug][rank=%s] %s", rank, text)
+    _SCHEDULE_BWD_DEBUG_COUNT += 1
 
 
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
@@ -190,6 +236,12 @@ class ScheduleNode:
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
+        _bwd_dbg(
+            lambda: (
+                f"{self.name}.default_backward_func before "
+                f"outputs={_tensor_summary(outputs)} output_grad={_tensor_summary(output_grad)}"
+            )
+        )
         Variable._execution_engine.run_backward(
             tensors=outputs,
             grad_tensors=output_grad,
@@ -198,6 +250,12 @@ class ScheduleNode:
             inputs=tuple(),
             allow_unreachable=True,
             accumulate_grad=True,
+        )
+        _bwd_dbg(
+            lambda: (
+                f"{self.name}.default_backward_func after "
+                f"output_grad={_tensor_summary(output_grad)}"
+            )
         )
         return output_grad
 
@@ -260,7 +318,19 @@ class ScheduleNode:
                     f"{len(outputs)} of {type(outputs[0])} is not equal to "
                     f"{len(output_grad)} of {type(output_grad[0])}"
                 )
+                _bwd_dbg(
+                    lambda: (
+                        f"{self.name}._backward call "
+                        f"outputs={_tensor_summary(outputs)} output_grad={_tensor_summary(output_grad)}"
+                    )
+                )
                 output_grad = self.backward_func(outputs, output_grad)
+                _bwd_dbg(
+                    lambda: (
+                        f"{self.name}._backward return "
+                        f"returned_grad={_tensor_summary(output_grad)}"
+                    )
+                )
             torch.cuda.nvtx.range_pop()
 
         # output_grad maybe from another stream
@@ -276,6 +346,7 @@ class ScheduleNode:
                         g.untyped_storage().resize_(0)
 
         grads = self.get_grad()
+        _bwd_dbg(lambda: f"{self.name}._backward input_grads={_tensor_summary(grads)}")
         self._release_state()
 
         return grads

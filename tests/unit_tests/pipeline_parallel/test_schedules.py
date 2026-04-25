@@ -39,10 +39,12 @@ rank = Utils.rank
 
 _DEFAULT_QWEN_MODEL_DIR = '/data/common/models/Qwen/Qwen3-30B-A3B-Base'
 
+# All schedule-test shape overrides live here (not env vars). Keys must match _load_schedule_test_model_params().
 _SCHEDULE_TEST_MODEL_PARAM_OVERRIDES = {
-    'seq_length': 4096,
-    'num_hidden_layers': 8,
-    'num_microbatches': 32,
+    'seq_length': 8192,
+    'micro_batch_size': 1,
+    'num_microbatches': 16,
+    'num_layers': 16,
 }
 
 
@@ -105,7 +107,31 @@ def _schedule_test_repo_root():
     return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 
 
+def _resolve_schedule_test_qwen_model_dir():
+    """Directory containing config.json (same schema as Qwen3-30B-A3B-Base).
+
+    Override with SCHEDULE_TEST_QWEN_MODEL_DIR. If the cluster path is missing, fall back to
+    Megatron-LM-Enhanced/, then its parent (workspace root, e.g. Megatron-LM-AutoTuner/config.json).
+    """
+    env = os.environ.get('SCHEDULE_TEST_QWEN_MODEL_DIR', '').strip()
+    if env:
+        return os.path.abspath(env)
+    if os.path.isdir(_DEFAULT_QWEN_MODEL_DIR):
+        return _DEFAULT_QWEN_MODEL_DIR
+    enhanced_root = _schedule_test_repo_root()
+    workspace_root = os.path.abspath(os.path.join(enhanced_root, '..'))
+    for candidate in (enhanced_root, workspace_root):
+        repo_cfg = os.path.join(candidate, 'config.json')
+        if os.path.isfile(repo_cfg):
+            return candidate
+    return _DEFAULT_QWEN_MODEL_DIR
+
+
 def _default_schedule_test_trace_dir():
+    # Prefer explicit TRACE_DIR (exported by run_test_schedules.sh) over per-rank timestamps.
+    explicit = os.environ.get('TRACE_DIR', '').strip()
+    if explicit:
+        return os.path.abspath(explicit)
     run_id = os.environ.get('RUN_ID', time.strftime('%Y%m%d_%H%M%S'))
     return os.path.join(_schedule_test_repo_root(), 'outputs', '1f1b_profiler', run_id)
 
@@ -264,11 +290,13 @@ def _should_enable_deepep(ep_size: int) -> bool:
 
 
 def _load_schedule_test_model_params():
-    with open(os.path.join(_DEFAULT_QWEN_MODEL_DIR, 'config.json')) as f:
+    model_dir = _resolve_schedule_test_qwen_model_dir()
+    config_path = os.path.join(model_dir, 'config.json')
+    with open(config_path) as f:
         qwen_config = json.load(f)
 
     model_params = {
-        'model_dir': _DEFAULT_QWEN_MODEL_DIR,
+        'model_dir': model_dir,
         'seq_length': 2048,
         'micro_batch_size': 1,
         'hidden_size': qwen_config['hidden_size'],
@@ -288,6 +316,23 @@ def _load_schedule_test_model_params():
         'activation_func': torch.nn.functional.silu,
     }
     model_params.update(_SCHEDULE_TEST_MODEL_PARAM_OVERRIDES)
+
+    assert model_params['moe_router_topk'] <= model_params['num_moe_experts'], (
+        f"moe_router_topk={model_params['moe_router_topk']} "
+        f"exceeds num_moe_experts={model_params['num_moe_experts']}"
+    )
+    if os.environ.get('SCHEDULE_TEST_DEBUG', '1') != '0':
+        print(
+            "[schedule_test][model_params] "
+            f"seq_length={model_params['seq_length']} "
+            f"micro_batch_size={model_params['micro_batch_size']} "
+            f"num_microbatches={model_params['num_microbatches']} "
+            f"num_layers={model_params['num_layers']} "
+            f"num_moe_experts={model_params['num_moe_experts']} "
+            f"moe_router_topk={model_params['moe_router_topk']}",
+            file=sys.stderr,
+            flush=True,
+        )
     return model_params
 
 
@@ -1149,8 +1194,8 @@ def _run_1f1b_profiler_with_5d_parallel(
         pytest.skip("This test is intended to run under torchrun")
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
-    if world_size < 8 or world_size % 8 != 0:
-        pytest.skip("Requires WORLD_SIZE to be a multiple of 8 for tp=2, cp=2, ep=2, pp=2")
+    # if world_size < 8 or world_size % 8 != 0:
+    #     pytest.skip("Requires WORLD_SIZE to be a multiple of 8 for tp=2, cp=2, ep=2, pp=2")
 
     from megatron.core.enums import ModelType
     from megatron.core.models.common.model_chunk_schedule_plan import (
@@ -1171,11 +1216,15 @@ def _run_1f1b_profiler_with_5d_parallel(
             else 'INTERLEAVED_1F1B_TRACE_DIR'
         )
     )
-    trace_dir = _normalize_schedule_test_trace_dir(os.environ.get(trace_env))
+    trace_dir = _normalize_schedule_test_trace_dir(
+        os.environ.get(trace_env)
+        or os.environ.get('TRACE_DIR')
+        or os.environ.get('SCHEDULE_TEST_TRACE_DIR')
+    )
 
     tp_size = 2
-    cp_size = 2
-    ep_size = 4
+    cp_size = 4
+    ep_size = 8
     etp_size = 1
     pp_size = 2
     vpp_size = 2
@@ -1210,6 +1259,11 @@ def _run_1f1b_profiler_with_5d_parallel(
         f"mode overlap_moe_expert_parallel_comm={overlap_moe_expert_parallel_comm} "
         f"use_staggered={use_staggered}"
     )
+    if os.environ.get("CUDA_LAUNCH_BLOCKING", "0") != "0":
+        _debug_log(
+            "WARNING: CUDA_LAUNCH_BLOCKING is enabled; CUDA launches are synchronous and "
+            "compute/comm overlap in traces will be strongly suppressed."
+        )
 
     _initialize_model_parallel_for_torchrun(
         tensor_model_parallel_size=tp_size,
@@ -1233,6 +1287,15 @@ def _run_1f1b_profiler_with_5d_parallel(
     use_deepep = _should_enable_deepep(ep_size)
     moe_dispatcher_type = "flex" if use_deepep else "alltoall"
     fine_grained_offload = os.environ.get("SCHEDULE_FINE_GRAINED_OFFLOAD", "0") == "1"
+    # Keep behavior close to upstream Megatron-LM for the conventional interleaved path:
+    # fine-grained activation offload is validated with combined/staggered flows, while
+    # non-combined interleaved (overlap_moe_expert_parallel_comm=False) is run without it.
+    if fine_grained_offload and (not overlap_moe_expert_parallel_comm) and (not use_staggered):
+        _debug_log(
+            "disable fine_grained_activation_offloading for non-combined interleaved path "
+            "(upstream-aligned test mode)"
+        )
+        fine_grained_offload = False
     offload_modules = []
     if fine_grained_offload:
         offload_modules = [

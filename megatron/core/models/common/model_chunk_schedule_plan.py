@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from contextlib import contextmanager, nullcontext
+import logging
 import os
 from typing import Optional
 
@@ -9,6 +10,7 @@ from torch import Tensor
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.network_engine.enums import ParallelDomain
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -16,14 +18,115 @@ from megatron.core.pipeline_parallel.utils import (
     get_comp_stream,
 )
 
-def _resolve_pp_stream():
-    """Best-effort PP stream resolver.
+try:
+    from megatron.core.network_engine import get_global_network_engine
+except ImportError:
+    get_global_network_engine = None
 
-    Older staggered implementations routed PP send hooks through a PP-specific
-    communication stream. The current codebase does not expose that API, so we
-    keep a local shim and fall back to the default communication stream.
-    """
-    return get_comm_stream()
+
+logger = logging.getLogger(__name__)
+_EP_STREAM_FALLBACK_WARNED = False
+_PP_STREAM_FALLBACK_WARNED = False
+_SCHEDULE_PHASE_DEBUG_COUNT = 0
+_SCHEDULE_PHASE_DEBUG_MAX = int(os.getenv("SCHEDULE_TEST_PHASE_DEBUG_MAX_LOGS", "4096"))
+
+
+def _schedule_phase_debug_enabled() -> bool:
+    return os.getenv("SCHEDULE_TEST_PHASE_DEBUG", "0") == "1"
+
+
+def _phase_tensor_summary(x):
+    if x is None:
+        return "None"
+    if isinstance(x, tuple):
+        return "(" + ", ".join(_phase_tensor_summary(e) for e in x) + ")"
+    if isinstance(x, list):
+        return "[" + ", ".join(_phase_tensor_summary(e) for e in x) + "]"
+    if isinstance(x, torch.Tensor):
+        shape = tuple(x.shape)
+        dtype = str(x.dtype).replace("torch.", "")
+        if x.numel() == 0:
+            return f"{shape}:{dtype}:numel=0"
+        if x.dtype.is_floating_point:
+            finite = int(torch.isfinite(x).all().item())
+            mn = float(x.detach().min().item())
+            mx = float(x.detach().max().item())
+            return f"{shape}:{dtype}:finite={finite}:min={mn:.4e}:max={mx:.4e}"
+        mn = int(x.detach().min().item())
+        mx = int(x.detach().max().item())
+        return f"{shape}:{dtype}:min={mn}:max={mx}"
+    return type(x).__name__
+
+
+def _phase_dbg(msg: str) -> None:
+    global _SCHEDULE_PHASE_DEBUG_COUNT
+    if not _schedule_phase_debug_enabled() or _SCHEDULE_PHASE_DEBUG_COUNT >= _SCHEDULE_PHASE_DEBUG_MAX:
+        return
+    rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_available() and torch.distributed.is_initialized()
+        else -1
+    )
+    logger.info("[SchedulePhaseDebug][rank=%s] %s", rank, msg)
+    _SCHEDULE_PHASE_DEBUG_COUNT += 1
+
+
+def _resolve_domain_stream(domain: ParallelDomain, fallback_stream):
+    """Resolve a domain-specific comm stream via NetworkEngine, matching upstream Megatron-LM."""
+
+    global _EP_STREAM_FALLBACK_WARNED
+    global _PP_STREAM_FALLBACK_WARNED
+
+    # Keep default behavior aligned with upstream Megatron-LM unless explicitly enabled.
+    if os.getenv("SCHEDULE_USE_NETWORK_ENGINE_STREAM", "0") != "1":
+        return fallback_stream
+
+    if get_global_network_engine is None:
+        return fallback_stream
+
+    try:
+        group = None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            from megatron.core import parallel_state
+
+            if domain == ParallelDomain.EP:
+                group = parallel_state.get_expert_model_parallel_group(check_initialized=False)
+            elif domain == ParallelDomain.CP:
+                group = parallel_state.get_context_parallel_group(check_initialized=False)
+            elif domain == ParallelDomain.PP:
+                group = parallel_state.get_pipeline_model_parallel_group(check_initialized=False)
+
+        stream = get_global_network_engine().get_comm_stream_for_domain(
+            domain=domain,
+            group=group,
+            intranode=None,
+        )
+        if stream is not None:
+            return stream
+    except Exception as exc:
+        if domain == ParallelDomain.EP and not _EP_STREAM_FALLBACK_WARNED:
+            _EP_STREAM_FALLBACK_WARNED = True
+            logger.warning(
+                "[NetworkEngine][Fallback] model_chunk EP stream resolve failed; "
+                "fallback to default comm stream; reason=%s: %s",
+                type(exc).__name__,
+                exc,
+            )
+        elif domain == ParallelDomain.PP and not _PP_STREAM_FALLBACK_WARNED:
+            _PP_STREAM_FALLBACK_WARNED = True
+            logger.warning(
+                "[NetworkEngine][Fallback] model_chunk PP stream resolve failed; "
+                "fallback to default comm stream; reason=%s: %s",
+                type(exc).__name__,
+                exc,
+            )
+
+    return fallback_stream
+
+
+def _resolve_pp_comm_stream():
+    """PP P2P hooks (staggered / deferred flush): NetworkEngine PP stream when available."""
+    return _resolve_domain_stream(ParallelDomain.PP, get_comm_stream())
 
 
 def _record_function_is_enabled() -> bool:
@@ -234,7 +337,13 @@ class TransformerLayerSchedulePlan:
         Returns:
             Functions or values for next iteration's computation
         """
-
+        _phase_dbg(
+            "Layer.run begin "
+            f"f_layer={getattr(getattr(f_layer, 'layer', None), 'layer_number', None)} "
+            f"b_layer={getattr(getattr(b_layer, 'layer', None), 'layer_number', None)} "
+            f"is_last_bwd={is_last_layer_in_bwd} "
+            f"f_input={_phase_tensor_summary(f_input)} b_grad={_phase_tensor_summary(b_grad)}"
+        )
         if b_layer is not None:
             with _torch_profiler_range("MTP_POST_PROCESS(B)"):
                 b_grad = b_layer.mtp_post_process.backward(b_grad)
@@ -286,7 +395,10 @@ class TransformerLayerSchedulePlan:
         if b_layer is not None and not is_last_layer_in_bwd:
             with _torch_profiler_range("ATTN(W)"):
                 b_layer.attn.backward_dw()
-
+        _phase_dbg(
+            "Layer.run end "
+            f"f_out={_phase_tensor_summary(f_input)} b_out={_phase_tensor_summary(b_grad)}"
+        )
         return f_input, b_grad
 
 
@@ -350,6 +462,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         comp_stream = get_comp_stream()
         comm_stream = get_comm_stream()
+        ep_comm_stream = _resolve_domain_stream(ParallelDomain.EP, comm_stream)
+        layer_comm_stream = (
+            comm_stream if type(self) is TransformerModelChunkSchedulePlan else ep_comm_stream
+        )
 
         # save the inputs of model.forward() to ModelChunkState
         self._model_chunk_state.input_ids = input_ids
@@ -374,8 +490,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # build layer schedule plan for each layer.
         # The methods to obtain layers are different for MTP so we need the other build plan for
         # MTP. Also, this can help annotate MTP layer so that it can know where MTP is.
-        self._build_layer_schedule_plan(model.decoder, comp_stream, comm_stream)
-        self._build_layer_schedule_plan(getattr(model, "mtp", None), comp_stream, comm_stream)
+        self._build_layer_schedule_plan(model.decoder, comp_stream, layer_comm_stream)
+        self._build_layer_schedule_plan(getattr(model, "mtp", None), comp_stream, layer_comm_stream)
 
         # build post process
         if model.post_process:
@@ -483,6 +599,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             The output of the forward pass.
         """
         f_input = None
+        _phase_dbg(
+            "Chunk.run begin "
+            f"f_vp={getattr(f_schedule_plan, 'vp_stage', None)} "
+            f"b_vp={getattr(b_schedule_plan, 'vp_stage', None)} grad={_phase_tensor_summary(b_grad)}"
+        )
         if f_schedule_plan:
             # pp output send/receive sync
             if pre_forward is not None:
@@ -513,6 +634,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         for i in range(overlapped_layers):
             f_layer = f_schedule_plan.get_layer(i)
             b_layer = b_schedule_plan.pop_layer()
+            _phase_dbg(
+                f"Chunk.run overlap i={i} f_idx={i} b_remain={b_schedule_plan.num_layers()} "
+                f"f_input={_phase_tensor_summary(f_input)} b_grad={_phase_tensor_summary(b_grad)}"
+            )
             torch.cuda.nvtx.range_push(f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b")
             with _torch_profiler_range(f"Normal_F{i}_B{b_schedule_plan.num_layers()}"):
                 f_input, b_grad = TransformerLayerSchedulePlan.run(
@@ -529,6 +654,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # backward pass for the remaining layers
         for i in range(overlapped_layers, b_num_layers):
             b_layer = b_schedule_plan.pop_layer()
+            _phase_dbg(
+                f"Chunk.run b_only i={i} b_remain={b_schedule_plan.num_layers()} "
+                f"b_grad={_phase_tensor_summary(b_grad)}"
+            )
             torch.cuda.nvtx.range_push(f"layer_{b_schedule_plan.num_layers()}b")
             with _torch_profiler_range(f"Normal_B{b_schedule_plan.num_layers()}"):
                 _, b_grad = TransformerLayerSchedulePlan.run(
@@ -541,6 +670,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # forward pass for the remaining layers
         for i in range(overlapped_layers, f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
+            _phase_dbg(
+                f"Chunk.run f_only i={i} f_input={_phase_tensor_summary(f_input)}"
+            )
             torch.cuda.nvtx.range_push(f"layer_{i}f")
             with _torch_profiler_range(f"Normal_F{i}"):
                 f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
@@ -549,7 +681,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         if f_schedule_plan is not None and post_forward is not None:
             # post_forward()/send_forward_recv_forward() is running in the communication stream,
             # so the p2p comm could be overlapped with the attn backward
-            with torch.cuda.stream(_resolve_pp_stream()):
+            f_post_forward_stream = (
+                get_comm_stream()
+                if type(f_schedule_plan) is TransformerModelChunkSchedulePlan
+                else _resolve_domain_stream(ParallelDomain.PP, get_comm_stream())
+            )
+            with torch.cuda.stream(f_post_forward_stream):
                 f_schedule_plan.wait_current_stream()
                 with _torch_profiler_range("PP_SEND(F)"):
                     post_forward(f_input, f_schedule_plan.vp_stage)
@@ -584,7 +721,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_schedule_plan.wait_current_stream()
             # Release reference as early as possible, this helps avoid memory leak.
             b_schedule_plan.release_state()
-
+        _phase_dbg(f"Chunk.run end f_output={_phase_tensor_summary(f_input)}")
         return f_input
 
 
@@ -721,6 +858,16 @@ class StaggeredTransformerModelChunkSchedulePlan(TransformerModelChunkSchedulePl
         *,
         pre_forward=None,
     ):
+        """First part of layer 0 forward (staggered).
+
+        PP_PRE(F) + PRE_PROCESS(F) run whenever ``f_schedule_plan`` is set.
+
+        When ``prev_b_layer_0`` is set (pending from the previous microbatch): if
+        ``f_layer_0`` is also set, this is normal F0 overlap with that pending tail (plain
+        ``Staggered_*`` ranges). If ``f_layer_0`` is None, this call is ``flush_pending_backward``
+        only: use the ``[STAGGERED_only] part1_first_layer`` profiler range for that per-rank final
+        flush.
+        """
         f_input = None
         if f_schedule_plan is not None:
             if pre_forward is not None:
@@ -741,44 +888,72 @@ class StaggeredTransformerModelChunkSchedulePlan(TransformerModelChunkSchedulePl
         f_layer_0 = f_schedule_plan.get_layer(0) if f_num_layers > 0 else None
         is_first_steady = prev_b_layer_0 is None
 
-        if f_layer_0 is not None or prev_b_layer_0 is not None:
-            with _torch_profiler_range("Staggered_F0_B0_P1"):
-                f_input, prev_b_grad = StaggeredTransformerLayerSchedulePlan.run_staggered_part_1(
-                    f_layer_0,
-                    prev_b_layer_0,
-                    f_input=f_input,
-                    b_grad=prev_b_grad,
-                    is_last_layer_in_bwd=(prev_b_layer_0 is not None),
+        if prev_b_layer_0 is not None:
+            # Final flush: f_schedule_plan is None (flush_pending_backward) so f_layer_0 is None.
+            # Steady overlap: both set — same tail logic, no [STAGGERED_only] outer range.
+            is_final_flush = f_layer_0 is None
+            staggered_only_ctx = (
+                _torch_profiler_range(
+                    "[STAGGERED_only] part1_first_layer: prev_mb_pending + staggered_P1 + PP_SEND(B) + flush"
                 )
+                if is_final_flush
+                else nullcontext()
+            )
+            with staggered_only_ctx:
+                if f_layer_0 is not None or prev_b_layer_0 is not None:
+                    with _torch_profiler_range("Staggered_F0_B0_P1"):
+                        f_input, prev_b_grad = StaggeredTransformerLayerSchedulePlan.run_staggered_part_1(
+                            f_layer_0,
+                            prev_b_layer_0,
+                            f_input=f_input,
+                            b_grad=prev_b_grad,
+                            is_last_layer_in_bwd=(prev_b_layer_0 is not None),
+                        )
 
-        stored_post_backward = pending_state.get("post_backward") if pending_state is not None else None
-        if prev_b_layer_0 is not None and stored_post_backward is not None:
-            with torch.cuda.stream(_resolve_pp_stream()):
-                if prev_b_event is not None:
-                    prev_b_event.wait(torch.cuda.current_stream())
-                with _torch_profiler_range("PP_SEND(B)"):
-                    stored_post_backward(prev_b_grad, prev_b_vp_stage)
+                stored_post_backward = (
+                    pending_state.get("post_backward") if pending_state is not None else None
+                )
+                if prev_b_layer_0 is not None and stored_post_backward is not None:
+                    with torch.cuda.stream(_resolve_pp_comm_stream()):
+                        if prev_b_event is not None:
+                            prev_b_event.wait(torch.cuda.current_stream())
+                        with _torch_profiler_range("PP_SEND(B)"):
+                            stored_post_backward(prev_b_grad, prev_b_vp_stage)
 
-        if f_layer_0 is not None and not is_first_steady:
-            with _torch_profiler_range("DISPATCH(F)"):
-                f_input = f_layer_0.moe_dispatch.forward(f_input)
+                if f_layer_0 is not None and not is_first_steady:
+                    with _torch_profiler_range("DISPATCH(F)"):
+                        f_input = f_layer_0.moe_dispatch.forward(f_input)
 
-        if prev_b_layer_0 is not None and not is_first_steady:
-            with _torch_profiler_range("ATTN(W)"):
-                prev_b_layer_0.attn.backward_dw()
+                if prev_b_layer_0 is not None and not is_first_steady:
+                    with _torch_profiler_range("ATTN(W)"):
+                        prev_b_layer_0.attn.backward_dw()
 
-        if prev_b_pre_process is not None:
-            with _torch_profiler_range("PRE_PROCESS(B)"):
-                prev_b_pre_process.backward(prev_b_grad)
-            if prev_b_event is not None:
-                prev_b_event.wait(torch.cuda.current_stream())
-            prev_b_layer_0.release_state()
-            # Release model-chunk state references held by preprocess node.
-            if hasattr(prev_b_pre_process, "model_chunk_state") and prev_b_pre_process.model_chunk_state is not None:
-                prev_b_pre_process.model_chunk_state.model = None
-                prev_b_pre_process.model_chunk_state = None
+                if prev_b_pre_process is not None:
+                    with _torch_profiler_range("PRE_PROCESS(B)"):
+                        prev_b_pre_process.backward(prev_b_grad)
+                    if prev_b_event is not None:
+                        prev_b_event.wait(torch.cuda.current_stream())
+                    prev_b_layer_0.release_state()
+                    # Release model-chunk state references held by preprocess node.
+                    if (
+                        hasattr(prev_b_pre_process, "model_chunk_state")
+                        and prev_b_pre_process.model_chunk_state is not None
+                    ):
+                        prev_b_pre_process.model_chunk_state.model = None
+                        prev_b_pre_process.model_chunk_state = None
 
-        StaggeredTransformerModelChunkSchedulePlan._pending_bwd_state = None
+                StaggeredTransformerModelChunkSchedulePlan._pending_bwd_state = None
+        else:
+            # No pending backward from previous microbatch: current chunk F0 part1 only (baseline-like opening).
+            if f_layer_0 is not None:
+                with _torch_profiler_range("Staggered_F0_B0_P1"):
+                    f_input, _ = StaggeredTransformerLayerSchedulePlan.run_staggered_part_1(
+                        f_layer_0,
+                        None,
+                        f_input=f_input,
+                        b_grad=None,
+                        is_last_layer_in_bwd=False,
+                    )
         return f_input
 
     @staticmethod
@@ -842,7 +1017,7 @@ class StaggeredTransformerModelChunkSchedulePlan(TransformerModelChunkSchedulePl
                 b_layer.release_state()
 
         if f_schedule_plan is not None and post_forward is not None:
-            with torch.cuda.stream(_resolve_pp_stream()):
+            with torch.cuda.stream(_resolve_pp_comm_stream()):
                 f_schedule_plan.wait_current_stream()
                 with _torch_profiler_range("PP_SEND(F)"):
                     post_forward(f_input, f_schedule_plan.vp_stage)
