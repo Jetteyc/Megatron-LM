@@ -11,10 +11,8 @@ import torch
 from megatron.core.network_engine import (
     CommBackend,
     ParallelDomain,
-    resolve_backend,
-    resolve_backend_for_ranks,
+    resolve_backend_for_group,
 )
-from megatron.core.network_engine.topology import get_group_global_ranks
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
@@ -208,8 +206,7 @@ class MoELayer(BaseMoELayer):
                 pg_collection=pg_collection,
             )
         elif config.moe_token_dispatcher_type == "alltoall":
-            ep_global_ranks = get_group_global_ranks(pg_collection.ep)
-            ep_backend = resolve_backend_for_ranks(ParallelDomain.EP, ep_global_ranks).backend
+            ep_backend = resolve_backend_for_group(ParallelDomain.EP, pg_collection.ep).backend
             if ep_backend != CommBackend.TORCH_DIST:
                 raise RuntimeError(
                     "MoE alltoall dispatcher currently only supports torch_dist in this upgrade step, "
@@ -222,8 +219,7 @@ class MoELayer(BaseMoELayer):
                 pg_collection=pg_collection,
             )
         elif config.moe_token_dispatcher_type == "flex":
-            ep_global_ranks = get_group_global_ranks(pg_collection.ep)
-            ep_backend = resolve_backend_for_ranks(ParallelDomain.EP, ep_global_ranks).backend
+            ep_backend = resolve_backend_for_group(ParallelDomain.EP, pg_collection.ep).backend
             if ep_backend != CommBackend.DEEPEP:
                 raise RuntimeError(
                     "MoE flex dispatcher expects deepep backend in this code path, "

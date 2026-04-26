@@ -31,6 +31,11 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import QuantizationConfig
+try:
+    from megatron.core.network_engine import ParallelDomain, get_global_network_engine
+except ImportError:
+    ParallelDomain = None
+    get_global_network_engine = None
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
@@ -77,6 +82,22 @@ except ImportError:
         HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
+
+
+def _resolve_cp_stream_from_network_engine(cp_group):
+    if get_global_network_engine is None or ParallelDomain is None:
+        return None
+
+    if getattr(TEDotProductAttention, "cp_stream") is None:
+        TEDotProductAttention.cp_stream = torch.cuda.Stream()
+
+    return get_global_network_engine().get_comm_stream_or_fallback(
+        domain=ParallelDomain.CP,
+        fallback_stream=TEDotProductAttention.cp_stream,
+        group=cp_group,
+        intranode=None,
+        consumer="te_cp",
+    )
 
 
 class TransformerEngineConfigType(enum.Enum):
@@ -1229,13 +1250,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             assert is_te_min_version(
                 "1.0.0"
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
-            if getattr(TEDotProductAttention, "cp_stream") is None:
-                TEDotProductAttention.cp_stream = torch.cuda.Stream()
+            cp_stream = _resolve_cp_stream_from_network_engine(pg_collection.cp)
+            TEDotProductAttention.cp_stream = cp_stream
             extra_kwargs["cp_group"] = pg_collection.cp
             extra_kwargs["cp_global_ranks"] = torch.distributed.get_process_group_ranks(
                 pg_collection.cp
             )
-            extra_kwargs["cp_stream"] = TEDotProductAttention.cp_stream
+            extra_kwargs["cp_stream"] = cp_stream
             if is_te_min_version("1.10.0"):
                 if cp_comm_type is None:
                     extra_kwargs["cp_comm_type"] = "p2p"
@@ -1346,10 +1367,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.cp_group is not None:
                 self.cp_group = packed_seq_params.cp_group
+                cp_stream = _resolve_cp_stream_from_network_engine(self.cp_group)
+                TEDotProductAttention.cp_stream = cp_stream
                 super().set_context_parallel_group(
                     self.cp_group,
                     torch.distributed.get_process_group_ranks(self.cp_group),
-                    TEDotProductAttention.cp_stream,
+                    cp_stream,
                     self.cp_comm_type,
                 )
             # If cp_group is None but local_cp_size is provided,

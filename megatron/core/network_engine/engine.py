@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from .enums import CommBackend, ParallelDomain
-from .topology import are_ranks_in_single_node, get_local_world_size
+from .topology import are_ranks_in_single_node, get_group_global_ranks, get_local_world_size
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -102,6 +102,14 @@ def resolve_backend(domain: ParallelDomain, *, intranode: bool) -> BackendDecisi
 def resolve_cp_backend_name_for_ranks(cp_global_ranks: Iterable[int]) -> str:
     intranode = are_ranks_in_single_node(cp_global_ranks, get_local_world_size())
     return resolve_backend(ParallelDomain.CP, intranode=intranode).backend.value
+
+
+def resolve_cp_backend_name_for_group(group) -> str:
+    return resolve_cp_backend_name_for_ranks(get_group_global_ranks(group))
+
+
+def resolve_backend_for_group(domain: ParallelDomain, group) -> BackendDecision:
+    return resolve_backend_for_ranks(domain, get_group_global_ranks(group))
 
 
 def resolve_backend_for_ranks(domain: ParallelDomain, global_ranks: Iterable[int]) -> BackendDecision:

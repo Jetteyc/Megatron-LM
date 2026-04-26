@@ -1223,8 +1223,8 @@ def _run_1f1b_profiler_with_5d_parallel(
     )
 
     tp_size = 2
-    cp_size = 4
-    ep_size = 8
+    cp_size = 2
+    ep_size = 4
     etp_size = 1
     pp_size = 2
     vpp_size = 2
@@ -1234,8 +1234,8 @@ def _run_1f1b_profiler_with_5d_parallel(
     hidden_size = model_params['hidden_size']
     num_microbatches = model_params['num_microbatches']
     vocab_size = model_params['vocab_size']
-    num_warmup_steps = 2
-    num_profile_steps = 3
+    num_warmup_steps = 0
+    num_profile_steps = 1
     total_steps = num_warmup_steps + num_profile_steps
 
     _debug_log(

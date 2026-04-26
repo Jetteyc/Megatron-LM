@@ -5,11 +5,8 @@ from typing import Iterable, Optional
 import torch
 import torch.distributed as dist
 
-from .engine import resolve_backend, resolve_backend_for_ranks
+from .engine import resolve_backend, resolve_backend_for_group, resolve_backend_for_ranks
 from .enums import CommBackend, ParallelDomain
-from .topology import get_group_global_ranks
-
-
 def _resolve_torch_dist_backend(
     domain: ParallelDomain,
     *,
@@ -22,7 +19,7 @@ def _resolve_torch_dist_backend(
     elif ranks is not None:
         decision = resolve_backend_for_ranks(domain, ranks)
     elif group is not None:
-        decision = resolve_backend_for_ranks(domain, get_group_global_ranks(group))
+        decision = resolve_backend_for_group(domain, group)
     else:
         decision = resolve_backend(
             domain,

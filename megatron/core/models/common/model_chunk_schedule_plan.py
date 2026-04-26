@@ -25,8 +25,6 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
-_EP_STREAM_FALLBACK_WARNED = False
-_PP_STREAM_FALLBACK_WARNED = False
 _SCHEDULE_PHASE_DEBUG_COUNT = 0
 _SCHEDULE_PHASE_DEBUG_MAX = int(os.getenv("SCHEDULE_TEST_PHASE_DEBUG_MAX_LOGS", "4096"))
 
@@ -74,54 +72,15 @@ def _phase_dbg(msg: str) -> None:
 def _resolve_domain_stream(domain: ParallelDomain, fallback_stream):
     """Resolve a domain-specific comm stream via NetworkEngine, matching upstream Megatron-LM."""
 
-    global _EP_STREAM_FALLBACK_WARNED
-    global _PP_STREAM_FALLBACK_WARNED
-
-    # Keep default behavior aligned with upstream Megatron-LM unless explicitly enabled.
-    if os.getenv("SCHEDULE_USE_NETWORK_ENGINE_STREAM", "0") != "1":
-        return fallback_stream
-
     if get_global_network_engine is None:
         return fallback_stream
 
-    try:
-        group = None
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            from megatron.core import parallel_state
-
-            if domain == ParallelDomain.EP:
-                group = parallel_state.get_expert_model_parallel_group(check_initialized=False)
-            elif domain == ParallelDomain.CP:
-                group = parallel_state.get_context_parallel_group(check_initialized=False)
-            elif domain == ParallelDomain.PP:
-                group = parallel_state.get_pipeline_model_parallel_group(check_initialized=False)
-
-        stream = get_global_network_engine().get_comm_stream_for_domain(
-            domain=domain,
-            group=group,
-            intranode=None,
-        )
-        if stream is not None:
-            return stream
-    except Exception as exc:
-        if domain == ParallelDomain.EP and not _EP_STREAM_FALLBACK_WARNED:
-            _EP_STREAM_FALLBACK_WARNED = True
-            logger.warning(
-                "[NetworkEngine][Fallback] model_chunk EP stream resolve failed; "
-                "fallback to default comm stream; reason=%s: %s",
-                type(exc).__name__,
-                exc,
-            )
-        elif domain == ParallelDomain.PP and not _PP_STREAM_FALLBACK_WARNED:
-            _PP_STREAM_FALLBACK_WARNED = True
-            logger.warning(
-                "[NetworkEngine][Fallback] model_chunk PP stream resolve failed; "
-                "fallback to default comm stream; reason=%s: %s",
-                type(exc).__name__,
-                exc,
-            )
-
-    return fallback_stream
+    return get_global_network_engine().get_comm_stream_or_fallback(
+        domain=domain,
+        fallback_stream=fallback_stream,
+        intranode=None,
+        consumer="model_chunk",
+    )
 
 
 def _resolve_pp_comm_stream():

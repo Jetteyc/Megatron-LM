@@ -12,6 +12,7 @@ from megatron.core.config import is_experimental_enabled
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
+from megatron.core.network_engine import CommBackend, ParallelDomain, resolve_backend_for_group
 from megatron.core.tensor_parallel import (
     all_to_all,
     gather_from_sequence_parallel_region,
@@ -413,6 +414,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
         """
         super().__init__(config=config, pg_collection=pg_collection)
+        ep_backend = resolve_backend_for_group(ParallelDomain.EP, self.ep_group).backend
+        if ep_backend != CommBackend.TORCH_DIST:
+            raise RuntimeError(
+                "MoE AlltoAll token dispatcher currently only supports torch_dist in this upgrade step, "
+                f"but EP backend resolved to {ep_backend.value}"
+            )
         self.num_local_experts = num_local_experts
         assert config.num_moe_experts is not None
         self.num_experts = config.num_moe_experts
