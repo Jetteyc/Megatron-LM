@@ -1,0 +1,3 @@
+salloc -p gpu_h200 --gpus=4
+scancel 66012
+salloc -p gpu_a800 --gpus=8
