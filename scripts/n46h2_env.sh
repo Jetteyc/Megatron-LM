@@ -21,3 +21,7 @@ export PYTHONUNBUFFERED=1
 # Must be after conda activate, since conda overwrites LD_LIBRARY_PATH
 export NVSHMEM_HOME=/data/apps/nvhpc/25.11/Linux_x86_64/25.11/comm_libs/12.9/nvshmem
 export LD_LIBRARY_PATH=$NVSHMEM_HOME/lib:$LD_LIBRARY_PATH
+
+# NCCL pip wheel (2.30.4+, needed by DeepEP)
+NCCL_PIP_DIR=/data/home/scyb091/run/.conda/envs/megatron310/lib/python3.10/site-packages/nvidia/nccl
+export LD_LIBRARY_PATH=$NCCL_PIP_DIR/lib:$LD_LIBRARY_PATH

@@ -1,6 +1,6 @@
 #!/bin/bash
-# 单机 4 卡：勿与 --gpus 同时写 -c（本集群 Lua 会拒绝）；CPU 按分区 DefCpuPerGPU 自动分配。
-#SBATCH -J mg_1n4g_eq_runmd
+# Experiment: 1 node × 4 GPU (EP=2,TP=1,CP=2)
+#SBATCH -J exp_1n4g
 #SBATCH -p gpu_h100
 #SBATCH -N 1
 #SBATCH --gpus=4
@@ -10,7 +10,6 @@
 set -euo pipefail
 cd /data/home/scyb091/run/rjy/Megatron-LM
 
-# module 命令在 sbatch 环境不可用，需先初始化
 source /usr/share/modules/init/bash 2>/dev/null || true
 source scripts/n46h2_env.sh
 
@@ -28,7 +27,11 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 export SCHEDULE_TEST_QWEN_MODEL_DIR=/data/home/scyb091/run/models/Qwen3-30B-A3B-Base
 export SKIP_TEST_DATA_DOWNLOAD=1
 
-echo "single node 4gpu:" "$(hostname)"
-echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
+# 5D parallel: EP=2, TP=1, CP=2, PP=2, VPP=2, ETP=1
+export SCHEDULE_TEST_EP=2
+export SCHEDULE_TEST_TP=1
+export SCHEDULE_TEST_CP=2
 
-tests/unit_tests/pipeline_parallel/run_test_schedules.sh 2>&1 | tee singlenode_4gpu.log
+echo "1n4g: EP=2 TP=1 CP=2 PP=2 VPP=2  host=$(hostname)  WORLD=$(($NNODES * $NPROC_PER_NODE))"
+
+tests/unit_tests/pipeline_parallel/run_test_schedules.sh 2>&1 | tee exp_1n4g.log

@@ -2,3 +2,6 @@
 	path = third_party/TransformerEngine
 	url = git@github.com:Jetteyc/TransformerEngine.git
 	branch = my-local-dev-branch
+[submodule "third_party/DeepEP"]
+	path = third_party/DeepEP
+	url = git@github.com:deepseek-ai/DeepEP.git
